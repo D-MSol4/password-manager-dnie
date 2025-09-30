@@ -4,7 +4,6 @@ import shutil
 import re
 import json
 from cryptography.fernet import Fernet
-from crypto import encrypt_database, decrypt_database
 
 DB_FILENAME = "passwords.db"
 BACKUP_FILENAME = "passwords_backup.db"
@@ -57,7 +56,6 @@ def save_database(db, fernet_key):
         with LOCK:
             with open(DB_FILENAME, "wb") as f:
                 f.write(encrypted)
-        print("Database saved.")
         return True
     except Exception as e:
         print(f"Error saving database: {e}")
@@ -69,11 +67,12 @@ def backup_database():
         with LOCK:
             if os.path.exists(DB_FILENAME):
                 shutil.copy2(DB_FILENAME, BACKUP_FILENAME)
-                print("Database backup completed.")
+                return True
             else:
-                print("No database to backup.")
+                return False
     except Exception as e:
         print(f"Error backing up: {e}")
+        return False
 
 def restore_database():
     """Restore the database from backup."""
@@ -81,26 +80,24 @@ def restore_database():
         with LOCK:
             if os.path.exists(BACKUP_FILENAME):
                 shutil.copy2(BACKUP_FILENAME, DB_FILENAME)
-                print("Database restored from backup.")
+                return True
             else:
-                print("No backup found.")
+                return False
     except Exception as e:
         print(f"Error restoring backup: {e}")
+        return False
 
 def add_entry(db, service, username, password):
     """Add a new entry after validation."""
     if not is_valid_entry(service, username, password):
-        print("Invalid entry data. Please ensure all fields are non-empty and password meets policy.")
         return False
     db[service] = {"username": username, "password": password}
-    print(f"Service '{service}' added.")
     return True
 
 
 def edit_entry(db, service, username=None, password=None):
     """Edit username and/or password for an existing service with validation."""
     if service not in db:
-        print(f"Service '{service}' not found.")
         return False
 
     new_username = username if username is not None else db[service].get('username')
@@ -108,13 +105,11 @@ def edit_entry(db, service, username=None, password=None):
 
     # Validate updated entry:
     if not is_valid_entry(service, new_username, new_password):
-        print("Invalid entry data. Please ensure username and password fulfill requirements.")
         return False
 
     # Apply changes:
     db[service]['username'] = new_username
     db[service]['password'] = new_password
-    print(f"Service '{service}' updated.")
     return True
 
 
@@ -123,11 +118,28 @@ def get_entry(db, service):
     return db.get(service)
 
 def delete_entry(db, service):
-    """Delete entry if it exists."""
+    """Delete entry if it exists, returning a boolean."""
     if service in db:
         del db[service]
-        print(f"Service '{service}' deleted.")
+        return True
+    return False
 
 def list_services(db):
     """List all stored service names."""
     return list(db.keys())
+
+def destroy_database_files():
+    """Permanently delete the encrypted database and its backup."""
+    try:
+        removed = False
+        with LOCK:
+            if os.path.exists(DB_FILENAME):
+                os.remove(DB_FILENAME)
+                removed = True
+            if os.path.exists(BACKUP_FILENAME):
+                os.remove(BACKUP_FILENAME)
+                removed = True
+        return removed
+    except Exception as e:
+        print(f"Error destroying database files: {e}")
+        return False

@@ -1,22 +1,28 @@
 from cryptography.fernet import Fernet
 import json
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.backends import default_backend
+# Argon2id for password-based KDF
+from argon2.low_level import Type, hash_secret_raw
 
 def derive_key_from_password(password: str, salt: bytes) -> bytes:
-    """Derive a 32-byte Fernet key from a password using HKDF."""
-    password_bytes = password.encode('utf-8')
-    hkdf = HKDF(
-        algorithm=hashes.SHA256(),
-        length=32,
+    """
+    Derive a 32-byte key from a password using Argon2id (memory-hard).
+    The returned bytes are fed to base64.urlsafe_b64encode in main.py for Fernet.
+    """
+    password_bytes = password.encode("utf-8")
+    # Reasonable default parameters; tune to environment:
+    # - time_cost: iterations (3–6 typical)
+    # - memory_cost: KiB (e.g., 65536 = 64 MiB)
+    # - parallelism: CPU lanes (match CPU cores if desired)
+    key = hash_secret_raw(
+        secret=password_bytes,
         salt=salt,
-        info=b'password-manager-key-derivation',
-        backend=default_backend()
+        time_cost=3,
+        memory_cost=65536,   # 64 MiB
+        parallelism=2,
+        hash_len=32,
+        type=Type.ID,
     )
-    derived_key = hkdf.derive(password_bytes)
-    return derived_key
-
+    return key
 
 def generate_database_key():
     """Generate a random database key for Fernet encryption"""
@@ -41,18 +47,3 @@ def decrypt_database(encrypted_data, key):
     decrypted_data = f.decrypt(encrypted_data)
     data = json.loads(decrypted_data.decode())
     return data
-
-def derive_key_from_signature(signature, salt):
-    """
-    Derive a symmetric key from the smart card signature and salt,
-    using HKDF with SHA256.
-    Returns a 32-byte key suitable for Fernet.
-    """
-    kdf = HKDF(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=salt,
-        info=b'password-manager-key-derivation'
-    )
-    derived_key = kdf.derive(signature)
-    return derived_key
