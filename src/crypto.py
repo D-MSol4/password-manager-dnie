@@ -23,27 +23,3 @@ def derive_key_from_password(password: str, salt: bytes) -> bytes:
         type=Type.ID,
     )
     return key
-
-def generate_database_key():
-    """Generate a random database key for Fernet encryption"""
-    return Fernet.generate_key()
-
-def encrypt_database(data, key):
-    """
-    Encrypt the password database (Python dict) using Fernet symmetric encryption.
-    Returns encrypted bytes.
-    """
-    f = Fernet(key)
-    json_data = json.dumps(data).encode()  # Convert dict to JSON bytes
-    encrypted = f.encrypt(json_data)
-    return encrypted
-
-def decrypt_database(encrypted_data, key):
-    """
-    Decrypt the password database using Fernet symmetric encryption.
-    Returns the original Python dict.
-    """
-    f = Fernet(key)
-    decrypted_data = f.decrypt(encrypted_data)
-    data = json.loads(decrypted_data.decode())
-    return data
