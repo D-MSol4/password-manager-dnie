@@ -591,9 +591,6 @@ def run_session(timeout_minutes, parser):
 
                 # Data-access commands using cached fernet_key/db
                 if cmd == 'add':
-                    print(f"DEBUG: fernet_key_bytes type={type(fernet_key_bytes)}, len={len(fernet_key_bytes)}")  # DEBUG LINE
-                    print(f"DEBUG: fernet_key_bytes content: {fernet_key_bytes}")  # ADD THIS LINE
-                    print(f"DEBUG: First 20 chars: {fernet_key_bytes[:20]}")  # ADD THIS LINE
                     if not is_valid_entry(args.service, args.username, args.password):
                         print("Invalid entry. Check service, username, and password validity.")
                         continue
