@@ -251,17 +251,13 @@ def prompt_and_verify_password(load_salt_fn, derive_fn):
             except Exception:
                 pass
             
-            # Clean up any remaining data
+            # Clean up key_array (may already be zeroed on success, harmless to zero again)
             if key_array:
                 try:
                     zeroize1(key_array)
                 except Exception:
                     pass
-            if fernet_key:
-                try:
-                    zeroize1(fernet_key)
-                except Exception:
-                    pass
+
     
     # All attempts failed
     print(f"\n✗ Authentication failed after {MAX_ATTEMPTS} attempts.")
@@ -525,9 +521,9 @@ def run_session(timeout_minutes, parser):
 
     # Use context manager for automatic cleanup
     with SecureSession(timeout_minutes=timeout_minutes) as session:
-        session.fernet_key = fernet_key
+        fernet_key_bytes = bytes(fernet_key)  # Copy FIRST
+        session.fernet_key = fernet_key  # Then assign to session
         session.last_auth = datetime.now()
-        fernet_key_bytes = bytes(fernet_key)
 
         print(f"\nWelcome to Password Manager (session timeout: {timeout_minutes} minutes)")
         print("Commands: add, edit, list, show, delete, backup, restore, init, destroy-db, exit, help")
