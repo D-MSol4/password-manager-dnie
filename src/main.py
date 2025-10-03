@@ -1,7 +1,7 @@
 import argparse
-import getpass
 import os
 import base64
+import sys
 import shlex
 from datetime import datetime, timedelta
 from crypto import derive_key_from_password
@@ -157,6 +157,53 @@ class SecureSession:
         """Context manager exit - secure cleanup."""
         self.clear_key()
         return False
+    
+
+def input_password_masked(prompt='Password: ', mask_char='●'):
+    """Read password from the user with masking for each key stroke."""
+    print(prompt, end='', flush=True)
+    password = ''
+    try:
+        import msvcrt
+        while True:
+            ch = msvcrt.getch()
+            if ch in {b'\r', b'\n'}:  # Enter key
+                print()
+                break
+            elif ch == b'\x08':  # Backspace
+                if len(password) > 0:
+                    password = password[:-1]
+                    sys.stdout.write('\b \b')
+            elif ch == b'\x03':  # Ctrl-C
+                raise KeyboardInterrupt
+            else:
+                password += ch.decode('utf-8')
+                sys.stdout.write(mask_char)
+            sys.stdout.flush()
+    except ImportError:
+        import tty, termios
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setraw(sys.stdin.fileno())
+            while True:
+                ch = sys.stdin.read(1)
+                if ch in {'\r', '\n'}:
+                    print()
+                    break
+                elif ch == '\x7f':  # Backspace
+                    if len(password) > 0:
+                        password = password[:-1]
+                        sys.stdout.write('\b \b')
+                elif ch == '\x03':  # Ctrl-C
+                    raise KeyboardInterrupt
+                else:
+                    password += ch
+                    sys.stdout.write(mask_char)
+                sys.stdout.flush()
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    return password
 
 
 def prompt_master_password():
@@ -165,7 +212,7 @@ def prompt_master_password():
     Returns password as string (will be converted to bytearray for secure handling).
     """
     while True:
-        password = getpass.getpass("Enter master password: ")
+        password = input_password_masked("Enter master password: ")
         if is_valid_password(password):
             print("Password accepted.")
             return password
@@ -185,7 +232,7 @@ def prompt_and_verify_password(load_salt_fn, derive_fn):
     
     for attempt in range(1, MAX_ATTEMPTS + 1):
         print(f"\nAuthentication attempt {attempt}/{MAX_ATTEMPTS}")
-        password = getpass.getpass("Enter master password: ")
+        password = input_password_masked("Enter master password: ")
         
         # Validate format first
         if not is_valid_password(password):
