@@ -196,16 +196,26 @@ def list_services(db):
 
 
 def destroy_database_files():
-    """Permanently delete the encrypted database and its backup."""
+    """Permanently delete the encrypted database and its backup using secure deletion."""
     try:
         removed = False
         with LOCK:
+            # Securely delete main database file
             if os.path.exists(DB_FILENAME):
-                os.remove(DB_FILENAME)
-                removed = True
+                if secure_delete(DB_FILENAME):
+                    print(f"Securely deleted {DB_FILENAME}")
+                    removed = True
+                else:
+                    print(f"Warning: Could not securely delete {DB_FILENAME}")
+            
+            # Securely delete backup file
             if os.path.exists(BACKUP_FILENAME):
-                os.remove(BACKUP_FILENAME)
-                removed = True
+                if secure_delete(BACKUP_FILENAME):
+                    print(f"Securely deleted {BACKUP_FILENAME}")
+                    removed = True
+                else:
+                    print(f"Warning: Could not securely delete {BACKUP_FILENAME}")
+        
         return removed
     except PermissionError:
         print("Error: Unable to delete database files (permission denied)")
@@ -219,6 +229,7 @@ def destroy_database_files():
         print("Error: Failed to delete database files")
         logger.error(f"Unexpected error in destroy_database_files: {type(e).__name__}", exc_info=True)
         return False
+
 
 
 def secure_log_file():
@@ -252,3 +263,28 @@ def secure_log_file():
     except Exception:
         # Best effort - fail gracefully
         pass
+
+def secure_delete(file_path, passes=3):
+    """Securely delete a file by overwriting it multiple times with random data before removal."""
+    try:
+        if not os.path.exists(file_path):
+            return False
+        
+        # Get file size
+        file_size = os.path.getsize(file_path)
+        
+        # Overwrite file multiple times
+        with open(file_path, 'r+b') as f:
+            for _ in range(passes):
+                f.seek(0)
+                f.write(os.urandom(file_size))
+                f.flush()
+                os.fsync(f.fileno())
+        
+        # Finally remove the file
+        os.remove(file_path)
+        return True
+    except Exception as e:
+        print(f"Error securely deleting {file_path}: {e}")
+        logger.error(f"Failed to securely delete {file_path}", exc_info=True)
+        return False

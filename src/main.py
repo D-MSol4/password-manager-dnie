@@ -723,6 +723,10 @@ def run_session(timeout_minutes, parser):
                         continue
 
                     _ = prompt_master_password()  # re-auth
+
+                        # Securely delete old database files before re-init
+                    destroy_database_files()
+                    
                     salt = generate_salt()
                     save_salt(salt)
                     password = prompt_master_password()
