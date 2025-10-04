@@ -3,6 +3,7 @@ import os
 import base64
 import sys
 import shlex
+import pyperclip
 from datetime import datetime, timedelta
 from crypto import derive_key_from_password
 from database import (
@@ -409,6 +410,15 @@ def create_command_parser():
     show_p.add_argument('--reveal', action='store_true', 
                        help='Show password in plaintext (default: hidden for security)')
     
+    # COPY command - copy password to clipboard
+    copy_p = subparsers.add_parser('copy',
+        help='Copy password to clipboard without displaying it',
+        description='Copy a service password to clipboard securely (no screen output)')
+    copy_p.add_argument('service', help='Service name whose password to copy')
+    copy_p.add_argument('--timeout', type=int, default=10, 
+        help='Seconds before auto-clearing clipboard (default: 10, 0 to disable)')
+
+    
     # DELETE command
     delete_p = subparsers.add_parser('delete',
         help='Delete an entry',
@@ -475,6 +485,10 @@ def show_enhanced_help():
       Show entry details (password hidden by default)
       Example: show gmail
       Example: show gmail --reveal
+          
+  copy <service>
+      Copy password to clipboard without displaying it
+      Example: copy gmail
 
   delete <service> [-y]
       Delete an entry (prompts for confirmation)
@@ -559,7 +573,7 @@ def run_session(timeout_minutes, parser):
         session.last_auth = datetime.now()
 
         print(f"\nWelcome to Password Manager (session timeout: {timeout_minutes} minutes)")
-        print("Commands: add, edit, list, show, delete, backup, restore, init, destroy-db, exit, help")
+        print("Commands: add, edit, list, show, copy, delete, backup, restore, init, destroy-db, exit, help")
 
         try:
             while True:
@@ -780,6 +794,39 @@ def run_session(timeout_minutes, parser):
                     else:
                         print(f"No entry found for service '{args.service}'.")
 
+                elif cmd == 'copy':
+                    # COPY command - copy password to clipboard
+                    if hasattr(args, 'service'):
+                        service = args.service
+                        
+                        # Check if service exists
+                        if service not in db:
+                            print(f"Service '{service}' not found.")
+                            continue
+                        
+                        # Get the password
+                        entry = get_entry(db, service)
+                        if not entry:
+                            print(f"Failed to retrieve entry for {service}.")
+                            continue
+                        
+                        password = entry['password']
+                        
+                        try:
+                            # Copy to clipboard
+                            pyperclip.copy(password)
+                            print(f"Password for '{service}' copied to clipboard.")
+                            print("⚠️  Remember to clear clipboard after use (paste or copy something else)")
+                            del password
+                            session.last_auth = datetime.now()
+
+                        except Exception as e:
+                            print(f"Failed to copy to clipboard: {e}")
+                            print("Make sure pyperclip is installed: pip install pyperclip")
+                    else:
+                        print("Usage: copy <service>")
+
+
                 elif cmd == 'delete':
                     if not getattr(args, 'yes', False):
                         confirm = input(f"Type the service name to confirm deletion ('{args.service}'): ").strip()
@@ -887,9 +934,6 @@ def run_session(timeout_minutes, parser):
 
             # Session cleanup happens automatically via context manager
             print("Session ended. All sensitive data cleared from memory.")
-
-
-
 
 
 def main():
