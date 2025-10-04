@@ -288,3 +288,47 @@ def secure_delete(file_path, passes=3):
         print(f"Error securely deleting {file_path}: {e}")
         logger.error(f"Failed to securely delete {file_path}", exc_info=True)
         return False
+
+def generate_random_password(length=20):
+    """
+    Generate a cryptographically secure random password that meets policy requirements.
+    
+    Requirements:
+    - Length: 16-60 characters
+    - Must include: uppercase, lowercase, digit, special character
+    
+    Args:
+        length: Desired password length (16-60), default 20
+    
+    Returns:
+        str: Random password meeting all requirements
+    """
+    import secrets
+    import string
+    
+    if length < 16 or length > 60:
+        raise ValueError("Password length must be between 16 and 60 characters")
+    
+    # Define character sets
+    uppercase = string.ascii_uppercase
+    lowercase = string.ascii_lowercase
+    digits = string.digits
+    special = "!@#$%^&*()-_=+[]{}|;:,.<>?/"
+    
+    # Ensure at least one character from each required category
+    password_chars = [
+        secrets.choice(uppercase),
+        secrets.choice(lowercase),
+        secrets.choice(digits),
+        secrets.choice(special)
+    ]
+    
+    # Fill the rest with random characters from all sets
+    all_chars = uppercase + lowercase + digits + special
+    for _ in range(length - 4):
+        password_chars.append(secrets.choice(all_chars))
+    
+    # Shuffle to avoid predictable patterns
+    secrets.SystemRandom().shuffle(password_chars)
+    
+    return ''.join(password_chars)

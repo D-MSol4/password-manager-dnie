@@ -8,7 +8,7 @@ from crypto import derive_key_from_password
 from database import (
     is_valid_password, is_valid_entry, load_database, save_database,
     add_entry, edit_entry, list_services, get_entry, delete_entry,
-    backup_database, restore_database, destroy_database_files
+    backup_database, restore_database, destroy_database_files, generate_random_password
 )
 
 # Import secure memory handling
@@ -21,6 +21,28 @@ except ImportError:
     import sys
     sys.exit(1)
 
+# Masked password input with fallback
+try:
+    import maskpass
+    
+    def input_password_masked(prompt='Password: '):
+        """Get password with masking using maskpass library."""
+        try:
+            return maskpass.askpass(prompt=prompt)
+        except KeyboardInterrupt:
+            print("\nOperation cancelled.")
+            raise
+        except Exception as e:
+            # If maskpass fails, fallback to getpass
+            import getpass
+            return getpass.getpass(prompt)
+        
+except ImportError:
+    import getpass
+    
+    def input_password_masked(prompt='Password: '):
+        """Fallback to getpass without masking."""
+        return getpass.getpass(prompt)
 
 DEFAULT_SESSION_MINUTES = 4 # default session inactivity timeout in minutes
 SALT_FILE = 'db_salt.bin'
@@ -157,53 +179,6 @@ class SecureSession:
         """Context manager exit - secure cleanup."""
         self.clear_key()
         return False
-    
-
-def input_password_masked(prompt='Password: ', mask_char='●'):
-    """Read password from the user with masking for each key stroke."""
-    print(prompt, end='', flush=True)
-    password = ''
-    try:
-        import msvcrt
-        while True:
-            ch = msvcrt.getch()
-            if ch in {b'\r', b'\n'}:  # Enter key
-                print()
-                break
-            elif ch == b'\x08':  # Backspace
-                if len(password) > 0:
-                    password = password[:-1]
-                    sys.stdout.write('\b \b')
-            elif ch == b'\x03':  # Ctrl-C
-                raise KeyboardInterrupt
-            else:
-                password += ch.decode('utf-8')
-                sys.stdout.write(mask_char)
-            sys.stdout.flush()
-    except ImportError:
-        import tty, termios
-        fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
-        try:
-            tty.setraw(sys.stdin.fileno())
-            while True:
-                ch = sys.stdin.read(1)
-                if ch in {'\r', '\n'}:
-                    print()
-                    break
-                elif ch == '\x7f':  # Backspace
-                    if len(password) > 0:
-                        password = password[:-1]
-                        sys.stdout.write('\b \b')
-                elif ch == '\x03':  # Ctrl-C
-                    raise KeyboardInterrupt
-                else:
-                    password += ch
-                    sys.stdout.write(mask_char)
-                sys.stdout.flush()
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-    return password
 
 
 def prompt_master_password():
@@ -212,7 +187,7 @@ def prompt_master_password():
     Returns password as string (will be converted to bytearray for secure handling).
     """
     while True:
-        password = input_password_masked("Enter master password: ")
+        password = input_password_masked(prompt="Enter master password: ")
         if is_valid_password(password):
             print("Password accepted.")
             return password
@@ -232,7 +207,7 @@ def prompt_and_verify_password(load_salt_fn, derive_fn):
     
     for attempt in range(1, MAX_ATTEMPTS + 1):
         print(f"\nAuthentication attempt {attempt}/{MAX_ATTEMPTS}")
-        password = input_password_masked("Enter master password: ")
+        password = input_password_masked(prompt="Enter master password: ")
         
         # Validate format first
         if not is_valid_password(password):
@@ -410,9 +385,8 @@ def create_command_parser():
         description='Add a new service with username and password to the database')
     add_p.add_argument('service', help='Service name (e.g., gmail, github, twitter)')
     add_p.add_argument('username', help='Username or email address for the service')
-    add_p.add_argument('password', help='Password (16-60 chars, uppercase, lowercase, digit, symbol)')
     
-    # EDIT command - ENHANCED
+    # EDIT command
     edit_p = subparsers.add_parser('edit',
         help='Edit an existing entry',
         description='Edit username and/or password for an existing service. Provide at least one option.')
@@ -480,69 +454,81 @@ def show_enhanced_help():
 ╚════════════════════════════════════════════════════════════════════╝
 
 📝 MANAGING ENTRIES
-──────────────────────────────────────────────────────────────────────
 
-  add <service> <username> <password>
-    Add a new password entry
-    Example: add gmail user@gmail.com MySecureP@ss123!
+  add <service> <username>
+      Add a new password entry with optional random password generation
+      Example: add gmail user@gmail.com
+      → Prompts: Generate random password? (y/n)
+      → If yes: Enter password length (16-60, default 20)
+      → Shows generated password and asks for confirmation
+      → If no: Prompts for manual password entry with masking
 
-  edit <service> [--username NEW_USER] [--password NEW_PASS]
-    Edit username and/or password for existing entry
-    Example: edit gmail --password NewP@ssword456!
-    Example: edit gmail --username newuser@gmail.com --password NewPass123!
+  edit <service>
+      Edit username and/or password for existing entry
+      Example: edit gmail
+      → Prompts: Change username? (y/n)
+      → Prompts: Change password? (y/n)
+      → If changing password: Generate random password? (y/n)
+      → Interactive flow for generation or manual entry
 
   show <service> [--reveal]
-    Show entry details (password hidden by default)
-    Example: show gmail
-    Example: show gmail --reveal
+      Show entry details (password hidden by default)
+      Example: show gmail
+      Example: show gmail --reveal
 
   delete <service> [-y]
-    Delete an entry (prompts for confirmation)
-    Example: delete gmail
-    Example: delete gmail -y  (skip confirmation)
+      Delete an entry (prompts for confirmation)
+      Example: delete gmail
+      Example: delete gmail -y    (skip confirmation)
 
   list
-    List all stored services
-    Example: list
+      List all stored services
+      Example: list
 
-🔧 DATABASE OPERATIONS
-──────────────────────────────────────────────────────────────────────
+💾 DATABASE OPERATIONS
 
   backup
-    Create a backup of the encrypted database
+      Create a backup of the encrypted database
 
   restore
-    Restore database from the most recent backup
+      Restore database from the most recent backup
 
   init
-    Re-initialize database with new master password
-    ⚠️  WARNING: This destroys all existing data!
+      Re-initialize database with new master password
+      ⚠️  WARNING: This destroys all existing data!
 
   destroy-db
-    Permanently delete database and all backups
-    ⚠️  WARNING: This is irreversible!
+      Permanently delete database and all backups
+      ⚠️  WARNING: This is irreversible!
 
-ℹ️  HELP & EXIT
-──────────────────────────────────────────────────────────────────────
+❓ HELP & EXIT
 
   help [command]
-    Show this help or help for specific command
-    Example: help
-    Example: help add
+      Show this help or help for specific command
+      Example: help
+      Example: help add
 
-  exit / quit
-    Exit password manager (secure cleanup)
+  exit | quit
+      Exit password manager (secure cleanup)
 
-📋 PASSWORD REQUIREMENTS
-──────────────────────────────────────────────────────────────────────
+🔐 PASSWORD REQUIREMENTS
+
   • Length: 16-60 characters
   • Must include: uppercase, lowercase, digit, special character
-  • Special characters: ! @ # $ % ^ & * ( ) - _ = + [ ] { } ; : , . < > ? /
-  • International characters supported: ñ á é ü ö etc.
-  • No spaces allowed
+  • Special characters: !@#$%^&*()-_=+[]{}|;:,.<>?/
+  • International characters supported (UTF-8)
+
+✨ PASSWORD GENERATOR FEATURES
+
+  • Cryptographically secure random generation using secrets module
+  • Customizable length (16-60 characters)
+  • Automatic compliance with password policy
+  • Preview before confirming
+  • Option to regenerate or enter manually
+  • Available in both 'add' and 'edit' commands
 
 💡 TIP: Type 'help <command>' for detailed help on any command
-    Example: help add
+      Example: help add
 """)
 
 
@@ -638,33 +624,138 @@ def run_session(timeout_minutes, parser):
 
                 # Data-access commands using cached fernet_key/db
                 if cmd == 'add':
-                    if not is_valid_entry(args.service, args.username, args.password):
-                        print("Invalid entry. Check service, username, and password validity.")
-                        continue
-                    if not add_entry(db, args.service, args.username, args.password):
-                        print(f"Add failed for service '{args.service}'.")
-                        continue
-                    if save_database(db, fernet_key_bytes):
-                        print(f"Entry added for service '{args.service}'.")
-                        session.last_auth = datetime.now()
+                    # ADD command with password generation option
+                    if hasattr(args, 'service') and hasattr(args, 'username'):
+                        service = args.service
+                        username = args.username
+                        
+                        # Ask if user wants to generate a random password
+                        gen_choice = input("Generate random password? (y/n): ").strip().lower()
+                        
+                        if gen_choice == 'y':
+                            # Ask for desired length
+                            while True:
+                                try:
+                                    length_input = input("Enter password length (16-60, default 20): ").strip()
+                                    if not length_input:
+                                        length = 20
+                                    else:
+                                        length = int(length_input)
+                                    
+                                    if 16 <= length <= 60:
+                                        break
+                                    else:
+                                        print("Length must be between 16 and 60.")
+                                except ValueError:
+                                    print("Invalid input. Please enter a number.")
+                            
+                            # Generate password
+                            password = generate_random_password(length)
+                            print(f"Generated password: {password}")
+                            
+                            # Ask for confirmation
+                            confirm = input("Use this password? (y/n): ").strip().lower()
+                            if confirm != 'y':
+                                password = input_password_masked(prompt="Enter new password manually: ")
+                        else:
+                            # Manual password entry
+                            password = input_password_masked(prompt="Enter new password manually: ")
+                        
+                        # Validate and add entry
+                        if not is_valid_entry(service, username, password):
+                            print("Invalid entry. Check service, username, and password validity.")
+                            continue
+                        
+                        if not add_entry(db, service, username, password):
+                            print(f"Add failed for service {service}.")
+                            continue
+                        
+                        if save_database(db, fernet_key_bytes):
+                            print(f"Entry added for service {service}.")
+                            session.last_auth = datetime.now()
+                        else:
+                            print("Failed to save database after add.")
                     else:
-                        print("Failed to save database after add.")
+                        print("Usage: add <service> <username>")
 
                 elif cmd == 'edit':
-                    if args.username is None and args.password is None:
-                        print("Nothing to update. Provide --username and/or --password.")
-                        continue
-                    if args.password is not None and not is_valid_password(args.password):
-                        print("Invalid new password. Password must be 16-60 chars with uppercase, lowercase, digits, and symbols.")
-                        continue
-                    if not edit_entry(db, args.service, username=args.username, password=args.password):
-                        print(f"Edit failed for service '{args.service}'.")
-                        continue
-                    if save_database(db, fernet_key_bytes):
-                        print(f"Entry edited for service '{args.service}'.")
-                        session.last_auth = datetime.now()
+                    # EDIT command with password generation option
+                    if hasattr(args, 'service'):
+                        service = args.service
+                        
+                        # Check if service exists
+                        if service not in db:
+                            print(f"Service '{service}' not found.")
+                            continue
+                        
+                        new_username = None
+                        new_password = None
+                        
+                        # Ask about username change
+                        change_username = input("Change username? (y/n): ").strip().lower()
+                        if change_username == 'y':
+                            new_username = input("Enter new username: ").strip()
+                            if not new_username:
+                                print("Username cannot be empty.")
+                                continue
+                        
+                        # Ask about password change
+                        change_password = input("Change password? (y/n): ").strip().lower()
+                        if change_password == 'y':
+                            # Ask if user wants to generate a random password
+                            gen_choice = input("Generate random password? (y/n): ").strip().lower()
+                            
+                            if gen_choice == 'y':
+                                # Ask for desired length
+                                while True:
+                                    try:
+                                        length_input = input("Enter password length (16-60, default 20): ").strip()
+                                        if not length_input:
+                                            length = 20
+                                        else:
+                                            length = int(length_input)
+                                        
+                                        if 16 <= length <= 60:
+                                            break
+                                        else:
+                                            print("Length must be between 16 and 60.")
+                                    except ValueError:
+                                        print("Invalid input. Please enter a number.")
+                                
+                                # Generate password
+                                new_password = generate_random_password(length)
+                                print(f"Generated password: {new_password}")
+                                
+                                # Ask for confirmation
+                                confirm = input("Use this password? (y/n): ").strip().lower()
+                                if confirm != 'y':
+                                    new_password = input_password_masked(prompt="Enter new password manually: ")
+                            else:
+                                # Manual password entry
+                                new_password = input_password_masked(prompt="Enter new password manually: ")
+                        
+                        # Check if anything to update
+                        if new_username is None and new_password is None:
+                            print("Nothing to update.")
+                            continue
+                        
+                        # Validate new password if provided
+                        if new_password is not None and not is_valid_password(new_password):
+                            print("Invalid new password. Password must be 16-60 chars with uppercase, lowercase, digits, and symbols.")
+                            continue
+                        
+                        # Update entry
+                        if not edit_entry(db, service, username=new_username, password=new_password):
+                            print(f"Edit failed for service {service}.")
+                            continue
+                        
+                        if save_database(db, fernet_key_bytes):
+                            print(f"Entry edited for service {service}.")
+                            session.last_auth = datetime.now()
+                        else:
+                            print("Failed to save database after edit.")
                     else:
-                        print("Failed to save database after edit.")
+                        print("Usage: edit <service>")
 
                 elif cmd == 'list':
                     services = list_services(db)
