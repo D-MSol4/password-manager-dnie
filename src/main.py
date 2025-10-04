@@ -417,7 +417,6 @@ def create_command_parser():
     copy_p.add_argument('service', help='Service name whose password to copy')
     copy_p.add_argument('--timeout', type=int, default=10, 
         help='Seconds before auto-clearing clipboard (default: 10, 0 to disable)')
-
     
     # DELETE command
     delete_p = subparsers.add_parser('delete',
@@ -437,6 +436,11 @@ def create_command_parser():
         help='Restore from backup',
         description='Restore database from the most recent backup file')
     
+    # LOCK command - immediately lock the session
+    lock_p = subparsers.add_parser('lock',
+        help='Lock the session immediately (requires re-authentication)',
+        description='Lock the current session and clear sensitive data from memory')
+
     # INIT command
     init_p = subparsers.add_parser('init',
         help='Re-initialize database',
@@ -506,7 +510,12 @@ def show_enhanced_help():
 
   restore
       Restore database from the most recent backup
-
+          
+  lock
+      Lock the session immediately (requires re-authentication)
+      Example: lock
+      → Clears session and requires master password to continue
+          
   init
       Re-initialize database with new master password
       ⚠️  WARNING: This destroys all existing data!
@@ -853,7 +862,22 @@ def run_session(timeout_minutes, parser):
                     session.last_auth = datetime.now()
                     if ok:
                         db = load_database(fernet_key_bytes)  # reload after restore
-                        
+                
+                elif cmd == 'lock':
+                    # LOCK command - immediately lock the session
+                    print("🔒 Session locked. All sensitive data cleared from memory.")
+                    
+                    # Force immediate re-authentication by expiring session
+                    session.last_auth = datetime.min
+                    
+                    # Optionally: clear the database from memory for extra security
+                    if db:
+                        db.clear()
+                    
+                    # The next iteration will trigger re-authentication
+                    continue
+
+        
                 elif cmd == 'init':
                     confirm = input("Type 'INIT' to confirm re-initialization (this overwrites keys and data): ").strip()
                     if confirm != "INIT":
