@@ -1,5 +1,18 @@
+# Cryptography libraries
 cryptography>=42.0.0
+
+# Password derivation (Argon2)
 argon2-cffi>=23.1.0
+
+# Smart card support
+pyscard>=2.0.7
+python-pkcs11>=0.7.0
+
+# Secure memory handling
 zeroize>=0.1.0
+
+# Password input with masking
 maskpass>=0.3.7
+
+# Clipboard support
 pyperclip>=1.11.0

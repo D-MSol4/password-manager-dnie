@@ -2,9 +2,12 @@ import os
 import sys
 import threading
 import shutil
+import string
+import secrets
 import re
 import json
 import logging
+import subprocess
 from cryptography.fernet import Fernet
 
 DB_FILENAME = "passwords.db"
@@ -47,83 +50,233 @@ def is_valid_entry(service, username, password):
         return False
     return True
 
-
-def load_database(fernet_key):
+class EncryptedDatabase:
     """
-    Load and decrypt the password database.
-
-    Returns:
-        dict: The decrypted database dictionary
-
-    Raises:
-        cryptography.fernet.InvalidToken: If wrong password/key (wrong decryption)
-        json.JSONDecodeError: If database format is corrupted
-        Exception: For other errors
-
-    Note: Only returns empty {} if file doesn't exist (not an error condition)
+    Database wrapper that keeps data encrypted in memory.
+    Decrypts on-demand for operations, then immediately re-encrypts.
     """
-    if not os.path.exists(DB_FILENAME):
-        # File doesn't exist yet - return empty database (not an error)
-        return {}
-
-    with LOCK:
-        with open(DB_FILENAME, "rb") as f:
-            encrypted = f.read()
-
-        fernet = Fernet(fernet_key)
-
-        # This raises InvalidToken if wrong key - LET IT PROPAGATE!
-        decrypted = fernet.decrypt(encrypted)
-
+    
+    def __init__(self, fernet_key):
+        """
+        Initialize with encryption key.
+        
+        Args:
+            fernet_key: bytes - Fernet encryption key
+        """
+        self.fernet_key = fernet_key
+        self.encrypted_data = None
+        self._load_encrypted()
+    
+    def _load_encrypted(self):
+        """Load encrypted database from disk (stays encrypted)."""
+        if os.path.exists(DB_FILENAME):
+            with open(DB_FILENAME, 'rb') as f:
+                self.encrypted_data = f.read()
+        else:
+            # New database - create empty encrypted dict
+            self.encrypted_data = self._encrypt_db({})
+    
+    def _encrypt_db(self, db):
+        """Encrypt database dict to bytes."""
+        fernet = Fernet(self.fernet_key)
+        db_bytes = json.dumps(db, indent=2).encode('utf-8')
+        encrypted = fernet.encrypt(db_bytes)
+        del fernet
+        del db_bytes
+        return encrypted
+    
+    def _decrypt_db(self):
+        """Decrypt database bytes to dict."""
+        fernet = Fernet(self.fernet_key)
+        decrypted = fernet.decrypt(self.encrypted_data)
         db = json.loads(decrypted.decode('utf-8'))
+        del fernet
+        del decrypted
         return db
+    
+    def _save_encrypted(self):
+        """Save encrypted database to disk."""
+        with open(DB_FILENAME, 'wb') as f:
+            f.write(self.encrypted_data)
+        secure_file_permissions(DB_FILENAME)
+    
+    # === READ OPERATIONS ===
+    
+    def get_entry(self, service):
+        """Get entry for a service (decrypt -> read -> cleanup)."""
+        try:
+            db = self._decrypt_db()
+            entry = db.get(service)
+            db.clear()
+            del db
+            return entry
+        except Exception as e:
+            logger.error(f"Failed to get entry: {e}")
+            return None
+    
+    def list_services(self):
+        """List all service names (decrypt -> list -> cleanup)."""
+        try:
+            db = self._decrypt_db()
+            services = list(db.keys())
+            db.clear()
+            del db
+            return services
+        except Exception as e:
+            logger.error(f"Failed to list services: {e}")
+            return []
+    
+    def service_exists(self, service):
+        """Check if service exists (decrypt -> check -> cleanup)."""
+        try:
+            db = self._decrypt_db()
+            exists = service in db
+            db.clear()
+            del db
+            return exists
+        except Exception as e:
+            logger.error(f"Failed to check service: {e}")
+            return False
+    
+    # === WRITE OPERATIONS ===
+    
+    def add_entry(self, service, username, password):
+        """Add new entry (decrypt -> modify -> encrypt -> save)."""
+        try:
+            db = self._decrypt_db()
+            
+            # Validate
+            if not is_valid_entry(service, username, password):
+                db.clear()
+                del db
+                return False
+            
+            # Add entry
+            db[service] = {"username": username, "password": password}
+            
+            # Re-encrypt and save
+            self.encrypted_data = self._encrypt_db(db)
+            self._save_encrypted()
+            
+            # Cleanup
+            db.clear()
+            del db
+            
+            return True
+        except Exception as e:
+            logger.error(f"Failed to add entry: {e}")
+            return False
+    
+    def edit_entry(self, service, username=None, password=None):
+        """Edit existing entry (decrypt -> modify -> encrypt -> save)."""
+        try:
+            db = self._decrypt_db()
+            
+            # Check exists
+            if service not in db:
+                db.clear()
+                del db
+                return False
+            
+            # Prepare new values
+            new_username = username if username is not None else db[service].get('username')
+            new_password = password if password is not None else db[service].get('password')
+            
+            # Validate
+            if not is_valid_entry(service, new_username, new_password):
+                db.clear()
+                del db
+                return False
+            
+            # Update entry
+            db[service]['username'] = new_username
+            db[service]['password'] = new_password
+            
+            # Re-encrypt and save
+            self.encrypted_data = self._encrypt_db(db)
+            self._save_encrypted()
+            
+            # Cleanup
+            db.clear()
+            del db
+            
+            return True
+        except Exception as e:
+            logger.error(f"Failed to edit entry: {e}")
+            return False
+    
+    def delete_entry(self, service):
+        """Delete entry (decrypt -> modify -> encrypt -> save)."""
+        try:
+            db = self._decrypt_db()
+            
+            if service not in db:
+                db.clear()
+                del db
+                return False
+            
+            # Delete entry
+            del db[service]
+            
+            # Re-encrypt and save
+            self.encrypted_data = self._encrypt_db(db)
+            self._save_encrypted()
+            
+            # Cleanup
+            db.clear()
+            del db
+            
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete entry: {e}")
+            return False
+    
+    def reload_from_disk(self):
+        """Reload encrypted data from disk (after restore)."""
+        self._load_encrypted()
+    
+    def clear(self):
+        """Clear encrypted data from memory."""
+        self.encrypted_data = None
 
 
 def save_database(db, fernet_key):
-    """Encrypt and save the password database."""
+    """Save database and secure permissions."""
     try:
-        data = json.dumps(db).encode('utf-8')
-        fernet = Fernet(fernet_key)
-        encrypted = fernet.encrypt(data)
-        
         with LOCK:
-            with open(DB_FILENAME, "wb") as f:
+            fernet = Fernet(fernet_key)
+            db_bytes = json.dumps(db, indent=2).encode('utf-8')
+            encrypted = fernet.encrypt(db_bytes)
+            del fernet
+            del db_bytes
+            
+            with open(DB_FILENAME, 'wb') as f:
                 f.write(encrypted)
-        return True
-    except PermissionError:
-        print("Error: Unable to save database (permission denied)")
-        logger.error(f"Permission denied writing to {DB_FILENAME}", exc_info=True)
-        return False
-    except OSError:
-        print("Error: Unable to save database (disk error)")
-        logger.error("OS error saving database", exc_info=True)
-        return False
-    except Exception as e:
-        print("Error: Failed to save database")
-        logger.error(f"Unexpected error in save_database: {type(e).__name__}", exc_info=True)
+            del encrypted
+            # Secure permissions immediately after creation
+            secure_file_permissions(DB_FILENAME)
+            
+            return True
+    except Exception:
+        logger.error("Failed to save database", exc_info=True)
         return False
 
 
 def backup_database():
-    """Backup the database file."""
+    """Backup database and secure permissions."""
     try:
         with LOCK:
-            if os.path.exists(DB_FILENAME):
-                shutil.copy2(DB_FILENAME, BACKUP_FILENAME)
-                return True
-            else:
+            if not os.path.exists(DB_FILENAME):
                 return False
-    except PermissionError:
-        print("Error: Unable to create backup (permission denied)")
-        logger.error("Permission denied creating backup", exc_info=True)
-        return False
-    except OSError:
-        print("Error: Unable to create backup (disk error)")
-        logger.error("OS error creating backup", exc_info=True)
-        return False
-    except Exception as e:
-        print("Error: Backup failed")
-        logger.error(f"Unexpected error in backup_database: {type(e).__name__}", exc_info=True)
+            
+            shutil.copy2(DB_FILENAME, BACKUP_FILENAME)
+            
+            # Secure backup file permissions
+            secure_file_permissions(BACKUP_FILENAME)
+            
+            return True
+    except Exception:
+        logger.error("Failed to backup database", exc_info=True)
         return False
 
 
@@ -150,73 +303,29 @@ def restore_database():
         return False
 
 
-
-def add_entry(db, service, username, password):
-    """Add a new entry after validation."""
-    if not is_valid_entry(service, username, password):
-        return False
-    db[service] = {"username": username, "password": password}
-    return True
-
-
-def edit_entry(db, service, username=None, password=None):
-    """Edit username and/or password for an existing service with validation."""
-    if service not in db:
-        return False
-
-    new_username = username if username is not None else db[service].get('username')
-    new_password = password if password is not None else db[service].get('password')
-
-    # Validate updated entry:
-    if not is_valid_entry(service, new_username, new_password):
-        return False
-
-    # Apply changes:
-    db[service]['username'] = new_username
-    db[service]['password'] = new_password
-    return True
-
-
-def get_entry(db, service):
-    """Retrieve entry for a service."""
-    return db.get(service)
-
-
-def delete_entry(db, service):
-    """Delete entry if it exists, returning a boolean."""
-    if service in db:
-        del db[service]
-        return True
-    return False
-
-
-def list_services(db):
-    """List all stored service names."""
-    return list(db.keys())
-
-
 def destroy_database_files():
-    """Permanently delete the encrypted database and its backup using secure deletion."""
+    """Permanently delete ALL database-related files using secure deletion."""
     try:
         removed = False
         with LOCK:
-            # Securely delete main database file
-            if os.path.exists(DB_FILENAME):
-                if secure_delete(DB_FILENAME):
-                    print(f"Securely deleted {DB_FILENAME}")
-                    removed = True
-                else:
-                    print(f"Warning: Could not securely delete {DB_FILENAME}")
+            # Define all files to delete
+            files_to_delete = [
+                DB_FILENAME,           # passwords.db
+                BACKUP_FILENAME,       # passwords_backup.db
+                "db_salt.bin",         # Salt file
+                "wrapped_key.bin"      # Wrapped K_db
+            ]
             
-            # Securely delete backup file
-            if os.path.exists(BACKUP_FILENAME):
-                if secure_delete(BACKUP_FILENAME):
-                    print(f"Securely deleted {BACKUP_FILENAME}")
-                    removed = True
-                else:
-                    print(f"Warning: Could not securely delete {BACKUP_FILENAME}")
-        
-        return removed
+            for file_path in files_to_delete:
+                if os.path.exists(file_path):
+                    if secure_delete(file_path):
+                        print(f"Securely deleted {file_path}")
+                        removed = True
+                    else:
+                        print(f"Warning: Could not securely delete {file_path}")
+            
+            return removed
+    
     except PermissionError:
         print("Error: Unable to delete database files (permission denied)")
         logger.error("Permission denied deleting database files", exc_info=True)
@@ -230,39 +339,6 @@ def destroy_database_files():
         logger.error(f"Unexpected error in destroy_database_files: {type(e).__name__}", exc_info=True)
         return False
 
-
-
-def secure_log_file():
-    """Ensure log file has restrictive permissions across all platforms."""
-    if not os.path.exists(LOG_FILENAME):
-        return
-    
-    try:
-        if sys.platform == 'win32':
-            # Windows: Use icacls to set owner-only ACL
-            import subprocess
-            username = os.getenv('USERNAME', '')
-            if username:
-                # Remove inherited permissions
-                subprocess.run(
-                    ['icacls', LOG_FILENAME, '/inheritance:r'],
-                    capture_output=True,
-                    check=False
-                )
-                # Grant read/write to owner only
-                subprocess.run(
-                    ['icacls', LOG_FILENAME, '/grant:r', f'{username}:(R,W)'],
-                    capture_output=True,
-                    check=False
-                )
-        else:
-            # Unix-like (Linux, macOS): Use chmod
-            import stat
-            os.chmod(LOG_FILENAME, stat.S_IRUSR | stat.S_IWUSR)  # 0o600
-            
-    except Exception:
-        # Best effort - fail gracefully
-        pass
 
 def secure_delete(file_path, passes=3):
     """Securely delete a file by overwriting it multiple times with random data before removal."""
@@ -303,8 +379,6 @@ def generate_random_password(length=20):
     Returns:
         str: Random password meeting all requirements
     """
-    import secrets
-    import string
     
     if length < 16 or length > 60:
         raise ValueError("Password length must be between 16 and 60 characters")
@@ -332,3 +406,53 @@ def generate_random_password(length=20):
     secrets.SystemRandom().shuffle(password_chars)
     
     return ''.join(password_chars)
+
+
+def secure_file_permissions(filepath):
+    """
+    Set restrictive permissions on a file (owner read/write only).
+    
+    Args:
+        filepath: Path to the file to secure
+    
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    if not os.path.exists(filepath):
+        return False
+    
+    try:
+        if sys.platform == 'win32':
+            # Windows: Use icacls to set owner-only permissions
+            
+            # Remove all permissions
+            subprocess.run(['icacls', filepath, '/inheritance:r'], 
+                          capture_output=True, check=False)
+            # Grant full control to current user only
+            subprocess.run(['icacls', filepath, '/grant:r', f'{os.getlogin()}:F'], 
+                          capture_output=True, check=False)
+        else:
+            # Unix/Linux/macOS: Use chmod 0600 (owner read/write only)
+            os.chmod(filepath, 0o600)
+        
+        return True
+    
+    except Exception as e:
+        logger.warning(f"Could not set restrictive permissions on {filepath}: {e}")
+        return False
+
+
+def secure_all_sensitive_files():
+    """Secure permissions on all sensitive files in the database."""
+    sensitive_files = [
+        DB_FILENAME,              # passwords.db
+        BACKUP_FILENAME,          # passwords_backup.db
+        "wrapped_key.bin",        # Wrapped database key
+        "db_salt.bin",            # Password salt
+        LOG_FILENAME              # password_manager.log
+    ]
+    
+    for filepath in sensitive_files:
+        if os.path.exists(filepath):
+            secure_file_permissions(filepath)
+

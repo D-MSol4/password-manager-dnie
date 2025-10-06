@@ -210,7 +210,5 @@ __marimo__/
 passwords.db
 db_salt.bin
 passwords_backup.db
-
-# Test files
-test_crypto.py
-test_database.py
+wrapped_key.bin
+password_manager.log

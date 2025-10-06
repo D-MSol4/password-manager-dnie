@@ -3,15 +3,16 @@ import os
 import base64
 import sys
 import shlex
+import json
 import pyperclip
 from datetime import datetime, timedelta
-from crypto import derive_key_from_password
+from cryptography.fernet import Fernet
+from crypto import derive_key_from_password, unwrap_database_key, wrap_database_key
 from database import (
-    is_valid_password, is_valid_entry, load_database, save_database,
-    add_entry, edit_entry, list_services, get_entry, delete_entry,
-    backup_database, restore_database, destroy_database_files, generate_random_password
+    EncryptedDatabase, is_valid_password, is_valid_entry, save_database, backup_database, restore_database, 
+    destroy_database_files, generate_random_password, secure_file_permissions, secure_all_sensitive_files
 )
-
+from smartcard_dnie import DNIeCard, DNIeCardError
 # Import secure memory handling
 try:
     from zeroize import zeroize1, mlock, munlock
@@ -29,24 +30,34 @@ try:
     def input_password_masked(prompt='Password: '):
         """Get password with masking using maskpass library."""
         try:
-            return maskpass.askpass(prompt=prompt)
+            return maskpass.askpass(prompt=prompt, mask='*')
         except KeyboardInterrupt:
             print("\nOperation cancelled.")
             raise
-        except Exception as e:
-            # If maskpass fails, fallback to getpass
-            import getpass
-            return getpass.getpass(prompt)
+        # Remove the generic Exception catch - let errors propagate
         
 except ImportError:
+    # Only fallback if maskpass is not installed at all
     import getpass
     
     def input_password_masked(prompt='Password: '):
         """Fallback to getpass without masking."""
         return getpass.getpass(prompt)
 
+# Force UTF-8 encoding on Windows (if not maskpass will give error with special chars)
+if sys.platform == 'win32':
+    # Set console to UTF-8 mode
+    os.system('chcp 65001 > nul')
+    # Also set Python's default encoding
+    if sys.stdout.encoding != 'utf-8':
+        import io
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
 DEFAULT_SESSION_MINUTES = 4 # default session inactivity timeout in minutes
 SALT_FILE = 'db_salt.bin'
+DB_FILENAME = "passwords.db"
+WRAPPED_KEY_FILE = "wrapped_key.bin"
 
 # Memory locking limits
 MAX_MLOCK_SIZE_LINUX = 2662 * 1024  # 2662 KB on Linux
@@ -106,62 +117,23 @@ class SecureSession:
             salt = load_salt_fn()
             password = prompt_fn()
 
-            # Convert password to bytearray for secure handling
-            password_bytes = bytearray(password.encode('utf-8'))
-            password_locked = False
-            key_bytearray_locked = False
+            # Derive key from password
+            key_bytes = derive_fn(password, salt)
+            # Remove reference to original password
+            del password
 
-            try:
-                # Lock password in memory (if small enough)
-                if len(password_bytes) < MAX_MLOCK_SIZE_LINUX:
-                    try:
-                        mlock(password_bytes)
-                        password_locked = True
-                    except Exception as e:
-                        print(f"Note: Could not lock password memory: {e}")
+            # Encode for Fernet (still as bytearray)
+            self.fernet_key = bytearray(base64.urlsafe_b64encode(key_bytes))
+            del key_bytes  # Remove reference to original key bytes
 
-                # Derive key from password
-                key_bytes = derive_fn(password, salt)
-
-                # Convert to bytearray and lock in memory
-                key_bytearray = bytearray(key_bytes)
-
-                if len(key_bytearray) < MAX_MLOCK_SIZE_LINUX:
-                    try:
-                        mlock(key_bytearray)
-                        key_bytearray_locked = True
-                    except Exception as e:
-                        print(f"Note: Could not lock key memory: {e}")
-
-                # Encode for Fernet (still as bytearray)
-                self.fernet_key = bytearray(base64.urlsafe_b64encode(key_bytearray))
-
-                # Lock the final Fernet key in memory
-                if len(self.fernet_key) < MAX_MLOCK_SIZE_LINUX:
-                    try:
-                        mlock(self.fernet_key)
-                        self._key_locked = True
-                    except Exception as e:
-                        print(f"Note: Could not lock fernet key memory: {e}")
-                        self._key_locked = False
-
-                # Securely zero intermediate values
-                # CRITICAL: Unlock BEFORE zeroizing
-                if key_bytearray_locked:
-                    try:
-                        munlock(key_bytearray)
-                    except Exception:
-                        pass
-                zeroize1(key_bytearray)
-
-            finally:
-                # Always zero the password
+            # Lock the final Fernet key in memory
+            if len(self.fernet_key) <= MAX_MLOCK_SIZE_LINUX:
                 try:
-                    if password_locked:
-                        munlock(password_bytes)
-                    zeroize1(password_bytes)
-                except Exception:
-                    pass
+                    mlock(self.fernet_key)
+                    self._key_locked = True
+                except Exception as e:
+                    print(f"Note: Could not lock fernet key memory: {e}")
+                    self._key_locked = False
 
             self.last_auth = datetime.now()
 
@@ -185,7 +157,6 @@ class SecureSession:
 def prompt_master_password():
     """
     Prompt for master password with validation.
-    Returns password as string (will be converted to bytearray for secure handling).
     """
     while True:
         password = input_password_masked(prompt="Enter master password: ")
@@ -193,119 +164,173 @@ def prompt_master_password():
             print("Password accepted.")
             return password
         else:
-            # Zero invalid password before continuing
-            temp = bytearray(password.encode('utf-8'))
-            zeroize1(temp)
+            del password  # Remove invalid password reference
             print("Invalid password. Password must be 16-60 chars with uppercase, lowercase, digits, and symbols. Try again.\n")
 
-def prompt_and_verify_password(load_salt_fn, derive_fn):
+def prompt_and_verify_two_factor():
     """
-    Prompt for master password and verify it can decrypt the database.
-    Returns (fernet_key, db) if successful, (None, None) on failure.
-    Includes secure memory zeroing on failed attempts.
+    Prompt for DNIe PIN + Password and authenticate.
+    Uses signature challenge to unwrap K_db, then decrypts database.
+    Returns (k_db) if successful, (None) on failure.
     """
     MAX_ATTEMPTS = 3
+    salt = load_salt()
+    
+    # Check if wrapped key file exists
+    if not os.path.exists(WRAPPED_KEY_FILE):
+        print(f"✗ Error: Wrapped key file not found: {WRAPPED_KEY_FILE}")
+        print("Database may not be initialized properly.")
+        return None
     
     for attempt in range(1, MAX_ATTEMPTS + 1):
-        print(f"\nAuthentication attempt {attempt}/{MAX_ATTEMPTS}")
-        password = input_password_masked(prompt="Enter master password: ")
+        print(f"\n{'=' * 80}")
+        print(f"TWO-FACTOR AUTHENTICATION (attempt {attempt}/{MAX_ATTEMPTS})")
+        print("=" * 80)
         
-        # Validate format first
-        if not is_valid_password(password):
-            print("Invalid password format.")
-            password_bytes = bytearray(password.encode('utf-8'))
-            zeroize1(password_bytes)
-            continue
+        # Factor 1: DNIe Signature Challenge
+        print("\nFACTOR 1: DNIe Signature Challenge")
+        print("Please insert your DNIe card into the reader...")
         
-        # Secure handling with cleanup
-        password_bytes = bytearray(password.encode('utf-8'))
-        password_locked = False
-        key_bytes = None
-        key_array = None
-        fernet_key = None
+        # Card detection retry loop (give user time to insert card)
+        card = None
+        dnie_wrapping_key = None
         
+        while True:
+            try:
+                card = DNIeCard()
+                card.connect()
+                print("✓ DNIe card detected")
+                break  # Card detected, exit retry loop
+                
+            except DNIeCardError as e:
+                if "not detected" in str(e).lower() or "no smart card" in str(e).lower():
+                    print("⚠  Card not detected.")
+                    retry = input("Press Enter to retry, or 'q' to quit: ").strip().lower()
+                    if retry == 'q':
+                        print("Authentication cancelled.")
+                        return None, None
+                    continue  # Retry card detection
+                else:
+                    # Other DNIe errors (not detection-related)
+                    print(f"✗ DNIe error: {e}")
+                    break  # Exit retry loop, count as failed attempt
+            except Exception as e:
+                print(f"✗ Error: {e}")
+                break  # Exit retry loop, count as failed attempt
+        
+        # If card connection failed for non-detection reasons, try next attempt
+        if card is None or not hasattr(card, 'session') or card.session is None:
+            if attempt < MAX_ATTEMPTS:
+                print(f"   {MAX_ATTEMPTS - attempt} attempts remaining.")
+                continue
+            else:
+                break
+        
+        # Card detected, now authenticate with PIN and get signature
         try:
-            # Lock password in memory
-            if len(password_bytes) < MAX_MLOCK_SIZE_LINUX:
+            pin = input_password_masked("Enter DNIe PIN: ")
+            dnie_wrapping_key = card.authenticate(pin)  # This signs the challenge
+            del pin  # Remove reference to PIN
+            card.disconnect()
+            
+        except DNIeCardError as e:
+            print(f"✗ DNIe authentication error: {e}")
+            if attempt < MAX_ATTEMPTS:
+                print(f"   {MAX_ATTEMPTS - attempt} attempts remaining.")
                 try:
-                    mlock(password_bytes)
-                    password_locked = True
-                except Exception:
+                    card.disconnect()
+                except:
                     pass
-            
-            # Derive key
-            salt = load_salt_fn()
-            key_bytes = derive_fn(password, salt)
-            key_array = bytearray(key_bytes)
-            fernet_key_bytes = base64.urlsafe_b64encode(key_array)
-            fernet_key = bytearray(fernet_key_bytes)
-            
-            # TRY TO DECRYPT DATABASE (this verifies the password!)
-            try:
-                db = load_database(bytes(fernet_key))
-                print("Password accepted.")
-                
-                # Success! Clean up intermediates
-                zeroize1(key_array)
-                
-                return fernet_key, db
-                
-            except Exception:
-                # Wrong password - decryption failed
-                print(f"✗ Incorrect password or database corruption.")
-                if attempt < MAX_ATTEMPTS:
-                    print(f"  {MAX_ATTEMPTS - attempt} attempt(s) remaining.")
-                
-                # Clean up wrong key
-                if key_array:
-                    zeroize1(key_array)
-                if fernet_key:
-                    zeroize1(fernet_key)
-                
-                key_array = None
-                fernet_key = None
+                continue
+            else:
+                try:
+                    card.disconnect()
+                except:
+                    pass
+                break
+        except Exception as e:
+            print(f"✗ Error: {e}")
+            if attempt < MAX_ATTEMPTS:
+                print(f"   {MAX_ATTEMPTS - attempt} attempts remaining.")
+                try:
+                    card.disconnect()
+                except:
+                    pass
+                continue
+            else:
+                try:
+                    card.disconnect()
+                except:
+                    pass
+                break
         
-        finally:
-            # ALWAYS zero password
-            try:
-                if password_locked:
-                    munlock(password_bytes)
-                zeroize1(password_bytes)
-            except Exception:
-                pass
+        # Factor 2: Master Password
+        print("\nFACTOR 2: Master Password")
+        password = input_password_masked("Enter master password: ")
             
-            # Clean up key_array (may already be zeroed on success, harmless to zero again)
-            if key_array:
-                try:
-                    zeroize1(key_array)
-                except Exception:
-                    pass
+        # Derive password key
+        password_key = derive_key_from_password(password, salt)
+        del password  # Remove reference to password
 
+        try:
+            # Load wrapped K_db from file
+            print("\nUnwrapping database key...")
+            with open(WRAPPED_KEY_FILE, 'rb') as f:
+                wrapped_k_db = f.read()
+            
+            # Unwrap K_db using DNIe + password keys
+            k_db = unwrap_database_key(wrapped_k_db, dnie_wrapping_key, password_key)
+            del dnie_wrapping_key
+            del password_key
+            del wrapped_k_db
+            print("✓ K_db unwrapped successfully")
+            
+            # Try to decrypt database with K_db
+            try:
+                print("Verifying database key...")
+                
+                # Just verify we can decrypt - don't keep the data!
+                with open(DB_FILENAME, 'rb') as f:
+                    encrypted = f.read()
+                
+                fernet = Fernet(k_db)
+                decrypted = fernet.decrypt(encrypted)
+                
+                # Verify it's valid JSON
+                json.loads(decrypted.decode('utf-8'))
+                
+                # Immediately cleanup - don't keep in memory!
+                del fernet
+                del decrypted
+                del encrypted
+                
+                print("\n✓ TWO-FACTOR AUTHENTICATION SUCCESSFUL!")
+                print("=" * 80)
+                
+                # Return ONLY k_db (as bytearray for session management)
+                return bytearray(k_db)
+            
+            except Exception as e:
+                print(f"✗ Authentication failed. Incorrect credentials or corrupted database.")
+                print(f"   Error: {e}")
+                if attempt < MAX_ATTEMPTS:
+                    print(f"   {MAX_ATTEMPTS - attempt} attempts remaining.")
+
+                del k_db # Clean up failed attempt     
+                    
+        except Exception as e:
+            print(f"✗ Unwrapping failed: {e}")
+            if attempt < MAX_ATTEMPTS:
+                print(f"   {MAX_ATTEMPTS - attempt} attempts remaining.")
+            # Clean up if variables exist
+            if 'dnie_wrapping_key' in locals():
+                del dnie_wrapping_key
+            if 'password_key' in locals():
+                del password_key
     
-    # All attempts failed
     print(f"\n✗ Authentication failed after {MAX_ATTEMPTS} attempts.")
     print("Exiting for security.")
-    return None, None
-
-def secure_clear_database(db):
-    """
-    Securely clear passwords from the database dictionary.
-
-    Args:
-        db: Dictionary containing password entries
-    """
-    if db is None:
-        return
-
-    for service, entry in db.items():
-        if isinstance(entry, dict) and 'password' in entry:
-            password_str = entry['password']
-            password_bytes = bytearray(password_str.encode('utf-8'))
-
-            try:
-                zeroize1(password_bytes)
-            except Exception:
-                pass
+    return None
 
 
 def generate_salt():
@@ -316,6 +341,8 @@ def save_salt(salt):
     """Save salt to file."""    
     with open(SALT_FILE, 'wb') as f:
         f.write(salt)
+    # Secure permissions immediately
+    secure_file_permissions(SALT_FILE)
 
 def load_salt():
     """Load salt from file."""
@@ -323,52 +350,160 @@ def load_salt():
         return f.read()
 
 def init_database():
-    """Initialize a new password database with secure key generation."""
-    if os.path.exists(SALT_FILE):
-        print("Database already initialized. Use --reset to start fresh.")
-        return
-
-    print("Initializing new password database...")
-
-    # Generate and save salt
+    """Initialize database with random K_db protected by DNIe signature + password."""
+    if os.path.exists(SALT_FILE) or os.path.exists(WRAPPED_KEY_FILE):
+        print("Database already initialized. Reset database to start fresh.")
+        return None
+    
+    print("=" * 80)
+    print("INITIALIZING PASSWORD MANAGER - SIGNATURE CHALLENGE")
+    print("=" * 80)
+    print("\n📋 This will:")
+    print("  1. Generate a random database key (K_db)")
+    print("  2. Sign a challenge with your DNIe to derive wrapping key")
+    print("  3. Derive a key from your master password")
+    print("  4. Wrap K_db with combined DNIe + password keys")
+    print("  5. Encrypt database with K_db")
+    print()
+    
+    # Initialize variables to None for cleanup tracking
+    dnie_wrapping_key = None
+    password_key = None
+    k_db = None
+    wrapped_k_db = None
+    
+    # Step 1: DNIe Signature Challenge with retry loop
+    print("\nSTEP 1: DNIe Signature Challenge")
+    print("Please insert your DNIe card into the reader...")
+    
+    card = None
+    dnie_wrapping_key = None
+    
+    # Card detection retry loop
+    while True:
+        try:
+            card = DNIeCard()
+            card.connect()
+            print("✓ DNIe card detected")
+            break  # Card detected, exit retry loop
+            
+        except DNIeCardError as e:
+            if "not detected" in str(e).lower() or "no smart card" in str(e).lower():
+                print("⚠  Card not detected.")
+                retry = input("Press Enter to retry, or 'q' to cancel initialization: ").strip().lower()
+                if retry == 'q':
+                    print("Initialization cancelled.")
+                    return None
+                continue  # Retry card detection
+            else:
+                # Other DNIe errors
+                print(f"✗ DNIe error: {e}")
+                print("Initialization failed.")
+                return None
+        except Exception as e:
+            print(f"✗ Error: {e}")
+            print("Initialization failed.")
+            return None
+    
+    # Card detected, now authenticate with PIN
+    try:
+        pin = input_password_masked("Enter DNIe PIN: ")
+        dnie_wrapping_key = card.authenticate(pin)
+        del pin  # Remove reference to PIN
+        print("✓ Signature challenge successful")
+        card.disconnect()
+        
+    except DNIeCardError as e:
+        print(f"✗ DNIe error: {e}")
+        print("Initialization failed.")
+        try:
+            card.disconnect()
+        except:
+            pass
+        return None
+    except Exception as e:
+        print(f"✗ Error: {e}")
+        print("Initialization failed.")
+        try:
+            card.disconnect()
+        except:
+            pass
+        return None
+    
+    # Step 2: Password Key Derivation
+    print("\nSTEP 2: Master Password Setup")
     salt = generate_salt()
     save_salt(salt)
-
-    # Prompt for master password
+    
     password = prompt_master_password()
-    password_bytes = bytearray(password.encode('utf-8'))
-
+    
     try:
-        # Lock password in memory temporarily
-        if len(password_bytes) < MAX_MLOCK_SIZE_LINUX:
-            try:
-                mlock(password_bytes)
-            except Exception as e:
-                print(f"Note: Could not lock password memory: {e}")
+        password_key = derive_key_from_password(password, salt)
+        del password  # Remove reference to password
+        print("✓ Password key derived")
+        
+        # Step 3: Generate random K_db
+        print("STEP 3: Generating random database key...")
+        k_db = Fernet.generate_key()  # Random 32-byte key
+        print(f"✓ Generated K_db ({len(k_db)} bytes)")
 
-        # Derive key
-        key_bytes = derive_key_from_password(password, salt)
-        fernet_key = base64.urlsafe_b64encode(key_bytes)
-
-        # Create empty database
+        # Step 4: Wrap K_db
+        print("\nSTEP 4: Wrapping database key...")
+        wrapped_k_db = wrap_database_key(k_db, dnie_wrapping_key, password_key)
+        del dnie_wrapping_key   # Remove reference to DNIe key
+        del password_key     # Remove reference to password key
+        
+        # Save wrapped K_db
+        with open(WRAPPED_KEY_FILE, 'wb') as f:
+            f.write(wrapped_k_db)
+        del wrapped_k_db  # Remove reference to wrapped key
+        # Secure permissions immediately
+        secure_file_permissions(WRAPPED_KEY_FILE)
+        print(f"✓ K_db wrapped and saved to {WRAPPED_KEY_FILE}")
+        
+        # Step 5: Create empty database encrypted with K_db
+        print("\nSTEP 5: Creating encrypted database...")
         empty_db = {}
-        save_database(empty_db, fernet_key)
+        save_database(empty_db, k_db)
+        print("✓ Database created and encrypted with K_db")
+        
+        print("\n" + "=" * 80)
+        print("✓ INITIALIZATION COMPLETE!")
+        print("=" * 80)
+        print("\n🔐 Your database is protected by:")
+        print("  • Random K_db (stored encrypted)")
+        print("  • DNIe signature challenge (requires card + PIN)")
+        print("  • Master password (Argon2id-derived key)")
 
-        print("Database initialized successfully!")
+        # Return k_db for immediate session start
+        return bytearray(k_db)
+    
+    except Exception as e:
+        print(f"\n✗ Initialization failed: {e}")
 
-        # Securely zero key material
-        key_array = bytearray(key_bytes)
-        zeroize1(key_array)
-        fernet_array = bytearray(fernet_key)
-        zeroize1(fernet_array)
-
-    finally:
-        # Always zero password
+        # Clean up sensitive variables if they exist
+        if 'k_db' in locals() and k_db is not None:
+            del k_db
+        if 'dnie_wrapping_key' in locals() and dnie_wrapping_key is not None:
+            del dnie_wrapping_key
+        if 'password_key' in locals() and password_key is not None:
+            del password_key
+        if 'wrapped_k_db' in locals() and wrapped_k_db is not None:
+            del wrapped_k_db
+        if 'password' in locals() and password is not None:
+            del password
+        # Clean up partial files if initialization failed
         try:
-            zeroize1(password_bytes)
-            munlock(password_bytes)
-        except Exception:
+            if os.path.exists(WRAPPED_KEY_FILE):
+                os.remove(WRAPPED_KEY_FILE)
+            if os.path.exists(SALT_FILE):
+                os.remove(SALT_FILE)
+            if os.path.exists(DB_FILENAME):
+                os.remove(DB_FILENAME)
+        except:
             pass
+    
+        return None
 
 def create_command_parser():
     """Create an argument parser for interactive session commands."""
@@ -555,65 +690,99 @@ def show_enhanced_help():
 """)
 
 
-def run_session(timeout_minutes, parser):
+def run_session(timeout_minutes, initial_k_db=None):
     """
-    Main interactive session with enhanced security.
+    Main interactive session with two-factor authentication (DNIe + Password).
     Uses SecureSession for automatic memory locking and cleanup.
     """
     if not os.path.exists(SALT_FILE):
-        print("No database found. Run with --init first.")
+        print("No database found.")
         return
     
     # Create command parser for interactive mode
     cmd_parser = create_command_parser()
-
-
-    # Authenticate with verification
-    result = prompt_and_verify_password(load_salt, derive_key_from_password)
-    if result[0] is None:
-        return  # Authentication failed
     
-    fernet_key, db = result
-
-    # Use context manager for automatic cleanup
+    # Authenticate or use provided keys
+    if initial_k_db is not None:
+        # Keys provided from initialization - use them directly
+        k_db = initial_k_db
+    else:
+        # Normal two-factor authentication (DNIe + Password)
+        k_db = prompt_and_verify_two_factor()
+        if k_db is None:
+            return
+    
     with SecureSession(timeout_minutes=timeout_minutes) as session:
-        fernet_key_bytes = bytes(fernet_key)  # Copy FIRST
-        session.fernet_key = fernet_key  # Then assign to session
+        
+        # Store in session for management
+        session.fernet_key = k_db
+        del k_db  # Remove reference to original k_db
         session.last_auth = datetime.now()
 
-        print(f"\nWelcome to Password Manager (session timeout: {timeout_minutes} minutes)")
-        print("Commands: add, edit, list, show, copy, delete, backup, restore, init, destroy-db, exit, help")
+        # Lock it in memory
+        if len(session.fernet_key) <= MAX_MLOCK_SIZE_LINUX:
+            try:
+                mlock(session.fernet_key)
+                session._key_locked = True
+            except Exception as e:
+                print(f"Note: Could not lock key in memory: {e}")
+                session._key_locked = False
+        
+        # Create on-demand database wrapper
+        encrypted_db = EncryptedDatabase(bytes(session.fernet_key))
 
+        print(f"\n{'=' * 80}")
+        print(f"PASSWORD MANAGER - SESSION ACTIVE")
+        print(f"{'=' * 80}")
+        print(f"Authentication: Two-Factor (DNIe + Password)")
+        print(f"Session timeout: {timeout_minutes} minutes")
+        print(f"Commands: add, edit, list, show, copy, delete, backup, restore, lock, init, destroy-db, exit, help")
+        print(f"{'=' * 80}\n")
+        
         try:
             while True:
                 try:
                     line = input("pm> ").strip()
                 except EOFError:
                     break
-
+                
                 if not line:
                     continue
-
+                
                 if line in ("exit", "quit"):
                     break
-
+                
                 # Re-authenticate if session expired
                 if session.expired():
-                    print("\nSession expired; please re-authenticate.")
-                    secure_clear_database(db)
+                    print("\n⏱  Session expired. Re-authentication required.")
+                    encrypted_db.clear()
                     
-                    result = prompt_and_verify_password(load_salt, derive_key_from_password)
-                    if result[0] is None:
+                    k_db = prompt_and_verify_two_factor()
+                    
+                    if k_db is None:
                         print("Re-authentication failed. Ending session.")
+                        del k_db
                         break
                     
                     session.clear_key()
-                    session.fernet_key = result[0]
-                    session.last_auth = datetime.now()
-                    fernet_key_bytes = bytes(result[0])
-                    db = result[1]
-                    print("Re-authenticated successfully.\n")
+                    session.fernet_key = k_db
+                    del k_db  # Remove reference to temporary result
 
+                    # Lock new key in memory
+                    if len(session.fernet_key) <= MAX_MLOCK_SIZE_LINUX:
+                        try:
+                            mlock(session.fernet_key)
+                            session._key_locked = True
+                        except Exception as e:
+                            print(f"Note: Could not lock key in memory: {e}")
+                            session._key_locked = False
+
+                    session.last_auth = datetime.now()
+
+                    # Create new database wrapper with new key
+                    encrypted_db = EncryptedDatabase(bytes(session.fernet_key))
+                    print("✓ Re-authenticated successfully.\n")
+                
                 # Handle help command with optional specific command
                 if line == "help" or line.startswith("help "):
                     if line.startswith("help "):
@@ -630,27 +799,34 @@ def run_session(timeout_minutes, parser):
                         # Show general help
                         show_enhanced_help()
                     continue
-
+                
                 # Parse the command
                 try:
                     args = cmd_parser.parse_args(shlex.split(line))
                 except (argparse.ArgumentError, SystemExit):
                     print("Invalid command. Type 'help' for usage.")
                     continue
-
+                
                 cmd = args.command
-
+                
                 if cmd is None:
                     print("Unknown command. Type 'help' for usage.")
                     continue
-
-
+                
                 # Data-access commands using cached fernet_key/db
                 if cmd == 'add':
                     # ADD command with password generation option
                     if hasattr(args, 'service') and hasattr(args, 'username'):
                         service = args.service
                         username = args.username
+
+                        # Check if service already exists
+                        if encrypted_db.service_exists(service):
+                            print(f"✗ Service '{service}' already exists.")
+                            print(f"   Use 'edit {service}' to modify it, or 'delete {service}' to remove it.")
+                            continue
+                        
+                        password = None  # Initialize password variable
                         
                         # Ask if user wants to generate a random password
                         gen_choice = input("Generate random password? (y/n): ").strip().lower()
@@ -664,7 +840,6 @@ def run_session(timeout_minutes, parser):
                                         length = 20
                                     else:
                                         length = int(length_input)
-                                    
                                     if 16 <= length <= 60:
                                         break
                                     else:
@@ -672,42 +847,56 @@ def run_session(timeout_minutes, parser):
                                 except ValueError:
                                     print("Invalid input. Please enter a number.")
                             
-                            # Generate password
-                            password = generate_random_password(length)
-                            print(f"Generated password: {password}")
-                            
-                            # Ask for confirmation
-                            confirm = input("Use this password? (y/n): ").strip().lower()
-                            if confirm != 'y':
-                                password = input_password_masked(prompt="Enter new password manually: ")
+                            # Generation loop with regenerate option
+                            while True:
+                                password = generate_random_password(length)
+                                print(f"\nGenerated password: {password}")
+                                
+                                choice = input("(u)se this, (r)egenerate, or (m)anual entry? [u/r/m]: ").strip().lower()
+                                
+                                if choice == 'u' or choice == '':
+                                    # Use generated password
+                                    break
+                                elif choice == 'r':
+                                    # Regenerate - loop continues
+                                    continue
+                                elif choice == 'm':
+                                    # Switch to manual entry
+                                    password = input_password_masked(prompt="Enter password manually: ")
+                                    break
+                                else:
+                                    print("Invalid choice. Please enter 'u', 'r', or 'm'.")
                         else:
                             # Manual password entry
-                            password = input_password_masked(prompt="Enter new password manually: ")
+                            password = input_password_masked(prompt="Enter password manually: ")
                         
                         # Validate and add entry
                         if not is_valid_entry(service, username, password):
                             print("Invalid entry. Check service, username, and password validity.")
+                            print("Password must be 16-60 chars with uppercase, lowercase, digits, and symbols.")
+                            if password is not None:
+                                del password  # Clean up password
                             continue
                         
-                        if not add_entry(db, service, username, password):
-                            print(f"Add failed for service {service}.")
-                            continue
-                        
-                        if save_database(db, fernet_key_bytes):
-                            print(f"Entry added for service {service}.")
+                        # Add entry (automatically encrypts)
+                        if encrypted_db.add_entry(service, username, password):
+                            print(f"✓ Entry added for service {service}.")
                             session.last_auth = datetime.now()
                         else:
-                            print("Failed to save database after add.")
+                            print(f"✗ Failed to add entry for {service}.")
+                        
+                        if password is not None:
+                            del password
                     else:
                         print("Usage: add <service> <username>")
-
+                
                 elif cmd == 'edit':
                     # EDIT command with password generation option
                     if hasattr(args, 'service'):
                         service = args.service
                         
                         # Check if service exists
-                        if service not in db:
+                        if not encrypted_db.service_exists(service):
                             print(f"Service '{service}' not found.")
                             continue
                         
@@ -737,7 +926,6 @@ def run_session(timeout_minutes, parser):
                                             length = 20
                                         else:
                                             length = int(length_input)
-                                        
                                         if 16 <= length <= 60:
                                             break
                                         else:
@@ -745,14 +933,25 @@ def run_session(timeout_minutes, parser):
                                     except ValueError:
                                         print("Invalid input. Please enter a number.")
                                 
-                                # Generate password
-                                new_password = generate_random_password(length)
-                                print(f"Generated password: {new_password}")
-                                
-                                # Ask for confirmation
-                                confirm = input("Use this password? (y/n): ").strip().lower()
-                                if confirm != 'y':
-                                    new_password = input_password_masked(prompt="Enter new password manually: ")
+                                # Generation loop with regenerate option
+                                while True:
+                                    new_password = generate_random_password(length)
+                                    print(f"\nGenerated password: {new_password}")
+                                    
+                                    choice = input("(u)se this, (r)egenerate, or (m)anual entry? [u/r/m]: ").strip().lower()
+                                    
+                                    if choice == 'u' or choice == '':
+                                        # Use generated password
+                                        break
+                                    elif choice == 'r':
+                                        # Regenerate - loop continues
+                                        continue
+                                    elif choice == 'm':
+                                        # Switch to manual entry
+                                        new_password = input_password_masked(prompt="Enter password manually: ")
+                                        break
+                                    else:
+                                        print("Invalid choice. Please enter 'u', 'r', or 'm'.")
                             else:
                                 # Manual password entry
                                 new_password = input_password_masked(prompt="Enter new password manually: ")
@@ -765,226 +964,209 @@ def run_session(timeout_minutes, parser):
                         # Validate new password if provided
                         if new_password is not None and not is_valid_password(new_password):
                             print("Invalid new password. Password must be 16-60 chars with uppercase, lowercase, digits, and symbols.")
+                            if new_password is not None:
+                                del new_password  # Clean up invalid password
                             continue
                         
                         # Update entry
-                        if not edit_entry(db, service, username=new_username, password=new_password):
-                            print(f"Edit failed for service {service}.")
-                            continue
-                        
-                        if save_database(db, fernet_key_bytes):
-                            print(f"Entry edited for service {service}.")
+                        if encrypted_db.edit_entry(service, username=new_username, password=new_password):
+                            print(f"✓ Entry edited for service {service}.")
                             session.last_auth = datetime.now()
                         else:
-                            print("Failed to save database after edit.")
+                            print(f"✗ Failed to edit entry for {service}.")
+                        
+                        if new_password is not None:
+                            del new_password
                     else:
                         print("Usage: edit <service>")
-
+                
                 elif cmd == 'list':
-                    services = list_services(db)
+                    services = encrypted_db.list_services()
                     if services:
                         print("Stored services:")
                         for service in services:
-                            print(f" - {service}")
-                            session.last_auth = datetime.now()
+                            print(f"  - {service}")
+                        del services # Clean up
+                        session.last_auth = datetime.now()
                     else:
                         print("No services stored.")
-
+                
                 elif cmd == 'show':
-                    entry = get_entry(db, args.service)
+                    entry = encrypted_db.get_entry(args.service)
                     if entry:
                         print(f"Entry for '{args.service}':")
-                        print(f" Username: {entry['username']}")
+                        print(f"  Username: {entry['username']}")
                         session.last_auth = datetime.now()
                         if getattr(args, 'reveal', False):
-                            print(f" Password: {entry['password']}")
+                            print(f"  Password: {entry['password']}")
                         else:
-                            print(" Password: [hidden]  (use --reveal to display)")
+                            print("  Password: [hidden] (use --reveal to display)")
                     else:
                         print(f"No entry found for service '{args.service}'.")
-
+                
                 elif cmd == 'copy':
                     # COPY command - copy password to clipboard
                     if hasattr(args, 'service'):
                         service = args.service
                         
                         # Check if service exists
-                        if service not in db:
+                        entry = encrypted_db.get_entry(service)
+                        if not entry:
                             print(f"Service '{service}' not found.")
                             continue
                         
                         # Get the password
-                        entry = get_entry(db, service)
-                        if not entry:
-                            print(f"Failed to retrieve entry for {service}.")
-                            continue
-                        
                         password = entry['password']
-                        
+                        del entry  # Clean up entry reference
+
                         try:
                             # Copy to clipboard
                             pyperclip.copy(password)
                             print(f"Password for '{service}' copied to clipboard.")
                             print("⚠️  Remember to clear clipboard after use (paste or copy something else)")
                             del password
+                            
                             session.last_auth = datetime.now()
-
+                            
                         except Exception as e:
                             print(f"Failed to copy to clipboard: {e}")
                             print("Make sure pyperclip is installed: pip install pyperclip")
+                            del password
                     else:
                         print("Usage: copy <service>")
-
-
+                
                 elif cmd == 'delete':
                     if not getattr(args, 'yes', False):
                         confirm = input(f"Type the service name to confirm deletion ('{args.service}'): ").strip()
                         if confirm != args.service:
                             print("Deletion aborted: confirmation did not match.")
                             continue
-                    if not delete_entry(db, args.service):
-                        print(f"Delete failed for service '{args.service}'.")
-                        continue
-                    if save_database(db, fernet_key_bytes):
-                        print(f"Entry deleted for service '{args.service}'.")
+                    
+                    if encrypted_db.delete_entry(args.service):
+                        print(f"✓ Entry deleted for service '{args.service}'.")
                         session.last_auth = datetime.now()
                     else:
-                        print("Failed to save database after delete.")
-
+                        print(f"✗ Failed to delete entry for '{args.service}'.")
+                
                 elif cmd == 'backup':
                     ok = backup_database()
                     print("Backup created." if ok else "Backup failed.")
                     session.last_auth = datetime.now()
-
+                
                 elif cmd == 'restore':
                     ok = restore_database()
-                    print("Database restored from backup." if ok else "Restore failed; no backup found or operation error.")
-                    session.last_auth = datetime.now()
                     if ok:
-                        db = load_database(fernet_key_bytes)  # reload after restore
+                        encrypted_db.reload_from_disk()
+                        print("✓ Database restored from backup.")
+                    else:
+                        print("✗ Restore failed.")
+                    session.last_auth = datetime.now()
                 
                 elif cmd == 'lock':
-                    # LOCK command - immediately lock the session
                     print("🔒 Session locked. All sensitive data cleared from memory.")
-                    
                     # Force immediate re-authentication by expiring session
                     session.last_auth = datetime.min
-                    
-                    # Optionally: clear the database from memory for extra security
-                    if db:
-                        db.clear()
-                    
                     # The next iteration will trigger re-authentication
+                    # Clear the database from memory for extra security
+                    encrypted_db.clear()
                     continue
-
-        
+                
                 elif cmd == 'init':
                     confirm = input("Type 'INIT' to confirm re-initialization (this overwrites keys and data): ").strip()
                     if confirm != "INIT":
                         print("Initialization aborted: confirmation did not match.")
                         continue
-
-                    _ = prompt_master_password()  # re-auth
-
-                        # Securely delete old database files before re-init
+                    
+                    # Re-authenticate before reinit
+                    k_db = prompt_and_verify_two_factor()
+                    if k_db is None:
+                        print("Re-authentication failed. Cannot reinitialize.")
+                        break
+                    del k_db  # Clean, we don't need this key
+                    
+                    # Securely delete old database files before re-init
                     destroy_database_files()
                     
-                    salt = generate_salt()
-                    save_salt(salt)
-                    password = prompt_master_password()
+                    # Call init_database() which now handles two-factor setup
+                    new_k_db = init_database()
+                    if new_k_db is None:
+                        print("Initialization failed. Ending session.")
+                        break
 
-                    # Secure handling with zeroize
-                    password_bytes = bytearray(password.encode('utf-8'))
-                    password_locked = False
-
-                    try:
-                        # Lock password temporarily
-                        if len(password_bytes) < MAX_MLOCK_SIZE_LINUX:
-                            try:
-                                mlock(password_bytes)
-                                password_locked = True
-                            except Exception as e:
-                                print(f"Note: Could not lock password memory: {e}")
-
-                        key_bytes = derive_key_from_password(password, salt)
-                        key_array = bytearray(key_bytes)
-                        fernet_key_bytes = base64.urlsafe_b64encode(key_array)
-                        fernet_key = bytearray(fernet_key_bytes)
-
-                        # Securely zero intermediate values
-                        zeroize1(key_array)
-
-                        db = {}  # wipe to empty
-
-                        if save_database(db, bytes(fernet_key)):
-                            print("Database re-initialized.")
-                            # Update session with new key
-                            session.clear_key()
-                            session.fernet_key = fernet_key
-                            session._key_locked = False
-                            session.last_auth = datetime.now()
-                            fernet_key_bytes = bytes(fernet_key)
-                        else:
-                            print("Failed to save database after re-initialization.")
-                            # Clean up fernet_key since we're not using it
-                            zeroize1(fernet_key)
-
-                    finally:
-                        # Always clean up password
+                    # Update session with new key
+                    session.clear_key()
+                    session.fernet_key = new_k_db
+                    del new_k_db  # Remove reference to temporary result
+                    # Lock new key in memory
+                    if len(session.fernet_key) <= MAX_MLOCK_SIZE_LINUX:
                         try:
-                            if password_locked:
-                                munlock(password_bytes)
-                            zeroize1(password_bytes)
-                        except Exception:
-                            pass
+                            mlock(session.fernet_key)
+                            session._key_locked = True
+                        except Exception as e:
+                            print(f"Note: Could not lock key in memory: {e}")
+                            session._key_locked = False
 
+                    session.last_auth = datetime.now()
+
+                    # Create new database wrapper with new key
+                    encrypted_db = EncryptedDatabase(bytes(session.fernet_key))
+                    print("✓ Database re-initialized successfully.")
+                
                 elif cmd == 'destroy-db':
                     confirm = input("Type 'DELETE' to confirm database destruction: ").strip()
                     if confirm != "DELETE":
                         print("Destruction aborted: confirmation did not match.")
                         continue
-                    _ = prompt_master_password()  # force re-auth even if session active
+                    
+                    # Force re-auth even if session active
+                    k_db = prompt_and_verify_two_factor()
+                    if k_db is None:
+                        print("Re-authentication failed. Cannot destroy database.")
+                        break
+                    del k_db  # Remove reference to temporary result
+
                     removed = destroy_database_files()
                     print("Database files removed." if removed else "No database files found to remove.")
                     break  # end session after destruction
-
+                
                 elif cmd == 'help':
                     cmd_parser.print_help()
-
+        
         finally:
             # Secure cleanup on exit
             print("\nSecurely cleaning up sensitive data...")
-            secure_clear_database(db)
-
-            # Session cleanup happens automatically via context manager
+            encrypted_db.clear()
+            session.clear_key()
             print("Session ended. All sensitive data cleared from memory.")
 
 
 def main():
-    """Main entry point with command-line argument parsing."""
+    """Main entry point for the password manager."""
 
-    # Secure the log file permissions
-    from database import secure_log_file
-    secure_log_file()
+    # Secure all sensitive files on startup
+    secure_all_sensitive_files()
 
-    parser = argparse.ArgumentParser(description="Secure Password Manager with Memory Protection")
-    parser.add_argument("--init", action="store_true", help="Initialize a new database")
-    parser.add_argument("--reset", action="store_true", help="Reset/destroy existing database")
-    parser.add_argument("--timeout", type=int, default=DEFAULT_SESSION_MINUTES,
-                        help=f"Session timeout in minutes (default: {DEFAULT_SESSION_MINUTES})")
-
-    args = parser.parse_args()
-
-    if args.reset:
-        destroy_database_files()
-        return
-
-    if args.init:
-        init_database()
-        return
-
-    # Run interactive session
-    run_session(args.timeout, parser)
+    # Check if database exists
+    if not os.path.exists(SALT_FILE) or not os.path.exists(WRAPPED_KEY_FILE):
+        # No database - run initialization
+        print("=" * 80)
+        print("WELCOME TO PASSWORD MANAGER")
+        print("=" * 80)
+        print("\nNo database found. Running first-time setup...\n")
+        
+        k_db = init_database()
+        if k_db is None:
+            return
+        
+        print("\n✓ Setup complete! Starting session...\n")
+        
+        # Start session with keys from init (skip authentication)
+        run_session(timeout_minutes=4, initial_k_db=k_db)
+        del k_db
+    else:
+        # Normal session (will authenticate)
+        run_session(timeout_minutes=4)
+    
 
 if __name__ == "__main__":
     main()
