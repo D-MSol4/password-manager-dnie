@@ -1,15 +1,41 @@
+# ==============================================================================
+# SYSTEM REQUIREMENTS
+# ==============================================================================
+# This application requires OpenSC to be installed on your system.
+# OpenSC provides the PKCS#11 library needed to communicate with DNIe cards.
+#
+# Installation instructions:
+#
+# Windows:
+#   Download and install from: https://github.com/OpenSC/OpenSC/releases
+#   Default path: C:\Program Files\OpenSC Project\OpenSC\pkcs11\opensc-pkcs11.dll
+#
+# Linux (Ubuntu/Debian):
+#   sudo apt-get install opensc-pkcs11
+#   Library path: /usr/lib/x86_64-linux-gnu/opensc-pkcs11.so
+#
+# macOS:
+#   brew install opensc
+#   Library path: /usr/local/lib/opensc-pkcs11.so
+#
+# ==============================================================================
+
+# ==============================================================================
+# PYTHON DEPENDENCIES
+# ==============================================================================
+
 # Cryptography libraries
 cryptography>=42.0.0
 
 # Password derivation (Argon2)
 argon2-cffi>=23.1.0
 
-# Smart card support
-pyscard>=2.0.7
+# Smart card support (Python wrapper for PKCS#11)
 python-pkcs11>=0.7.0
 
 # Secure memory handling
 zeroize>=0.1.0
+numpy>=2.0.0
 
 # Password input with masking
 maskpass>=0.3.7

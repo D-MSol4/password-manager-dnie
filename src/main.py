@@ -5,6 +5,8 @@ import sys
 import shlex
 import json
 import pyperclip
+import time
+import threading
 from datetime import datetime, timedelta
 from cryptography.fernet import Fernet
 from crypto import derive_key_from_password, unwrap_database_key, wrap_database_key
@@ -153,6 +155,26 @@ class SecureSession:
         self.clear_key()
         return False
 
+def auto_expire_session(session, check_interval=30):
+    """
+    Background thread that proactively expires session after timeout.
+    Checks every `check_interval` seconds and clears key if expired.
+    """ 
+    stop_event = threading.Event()
+    
+    def checker():
+        while not stop_event.is_set():
+            time.sleep(check_interval)
+            if session.expired():
+                print("\n⏱ Session expired due to inactivity. Clearing key...")
+                session.clear_key()
+                print("🔒 Session locked. Re-authentication required on next command.\n")
+                break
+    
+    thread = threading.Thread(target=checker, daemon=True, name="SessionExpiry")
+    thread.start()
+    return stop_event
+
 
 def prompt_master_password():
     """
@@ -208,7 +230,7 @@ def prompt_and_verify_two_factor():
                     retry = input("Press Enter to retry, or 'q' to quit: ").strip().lower()
                     if retry == 'q':
                         print("Authentication cancelled.")
-                        return None, None
+                        return None
                     continue  # Retry card detection
                 else:
                     # Other DNIe errors (not detection-related)
@@ -712,8 +734,7 @@ def run_session(timeout_minutes, initial_k_db=None):
         if k_db is None:
             return
     
-    with SecureSession(timeout_minutes=timeout_minutes) as session:
-        
+    with SecureSession(timeout_minutes=timeout_minutes) as session:     
         # Store in session for management
         session.fernet_key = k_db
         del k_db  # Remove reference to original k_db
@@ -728,6 +749,9 @@ def run_session(timeout_minutes, initial_k_db=None):
                 print(f"Note: Could not lock key in memory: {e}")
                 session._key_locked = False
         
+        # Start background thread to auto-expire session
+        expiry_stop = auto_expire_session(session, check_interval=30)
+
         # Create on-demand database wrapper
         encrypted_db = EncryptedDatabase(bytes(session.fernet_key))
 
