@@ -11,8 +11,9 @@ from datetime import datetime, timedelta
 from cryptography.fernet import Fernet
 from crypto import derive_key_from_password, unwrap_database_key, wrap_database_key
 from database import (
-    EncryptedDatabase, is_valid_password, is_valid_entry, save_database, backup_database, restore_database, 
-    destroy_database_files, generate_random_password, secure_file_permissions, secure_all_sensitive_files
+    EncryptedDatabase, DNIE_REGISTRY_FILE, is_valid_password, is_valid_entry, save_database, backup_database, restore_database, 
+    destroy_database_files, generate_random_password, secure_file_permissions, secure_all_sensitive_files,
+    get_db_filename, get_salt_filename, get_wrapped_key_filename, get_backup_filename, load_dnie_registry
 )
 from smartcard_dnie import DNIeCard, DNIeCardError
 # Import secure memory handling
@@ -57,13 +58,62 @@ if sys.platform == 'win32':
         sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 DEFAULT_SESSION_MINUTES = 4 # default session inactivity timeout in minutes
-SALT_FILE = 'db_salt.bin'
-DB_FILENAME = "passwords.db"
-WRAPPED_KEY_FILE = "wrapped_key.bin"
 
 # Memory locking limits
 MAX_MLOCK_SIZE_LINUX = 2662 * 1024  # 2662 KB on Linux
 MAX_MLOCK_SIZE_WINDOWS = 128 * 1024  # 128 KB default on Windows
+
+def save_dnie_registry(registry):
+    with open(DNIE_REGISTRY_FILE, 'w') as f:
+        json.dump(registry, f, indent=2)
+    secure_file_permissions(DNIE_REGISTRY_FILE)
+
+def is_dnie_registered(dnie_hash):
+    registry = load_dnie_registry()
+    return dnie_hash in registry.get('dnies', {})
+
+def get_user_id_from_dnie(dnie_hash):
+    registry = load_dnie_registry()
+    dnies = registry.get('dnies', {})
+    if dnie_hash in dnies:
+        return dnies[dnie_hash].get('user_id')
+    return None
+
+def register_dnie(dnie_hash, user_id, description=""):
+    registry = load_dnie_registry()
+    if 'dnies' not in registry:
+        registry['dnies'] = {}
+    if dnie_hash in registry['dnies']:
+        return False
+    registry['dnies'][dnie_hash] = {
+        'user_id': user_id,
+        'created': datetime.now().isoformat(),
+        'description': description,
+        'last_login': None
+    }
+    save_dnie_registry(registry)
+    return True
+
+def update_last_login(dnie_hash):
+    registry = load_dnie_registry()
+    if dnie_hash in registry.get('dnies', {}):
+        registry['dnies'][dnie_hash]['last_login'] = datetime.now().isoformat()
+        save_dnie_registry(registry)
+
+def get_next_user_id():
+    registry = load_dnie_registry()
+    existing_ids = []
+    for dnie_info in registry.get('dnies', {}).values():
+        user_id = dnie_info.get('user_id', '')
+        if user_id.startswith('user'):
+            try:
+                num = int(user_id.replace('user', ''))
+                existing_ids.append(num)
+            except:
+                pass
+    next_id = max(existing_ids, default=0) + 1
+    return f"user{next_id:03d}"
+
 
 class SecureSession:
     """
@@ -191,18 +241,22 @@ def prompt_master_password():
 
 def prompt_and_verify_two_factor():
     """
-    Prompt for DNIe PIN + Password and authenticate.
-    Uses signature challenge to unwrap K_db, then decrypts database.
-    Returns (k_db) if successful, (None) on failure.
+    Two-factor authentication with DNIe registration verification.
+    FIRST verifies that the DNIe is registered before attempting decryption.
+    
+    Returns:
+        tuple: (kdb, user_id) if successful, None on failure
     """
     MAX_ATTEMPTS = 3
-    salt = load_salt()
+
+    # STEP 1: Connect to DNIe and get serial hash
+    print("\n" + "="*80)
+    print("DNIe VERIFICATION")
+    print("="*80)
+    print("\nInsert your DNIe into the reader...")
     
-    # Check if wrapped key file exists
-    if not os.path.exists(WRAPPED_KEY_FILE):
-        print(f"✗ Error: Wrapped key file not found: {WRAPPED_KEY_FILE}")
-        print("Database may not be initialized properly.")
-        return None
+    card = None
+    dnie_hash = None
     
     for attempt in range(1, MAX_ATTEMPTS + 1):
         print(f"\n{'=' * 80}")
@@ -222,6 +276,10 @@ def prompt_and_verify_two_factor():
                 card = DNIeCard()
                 card.connect()
                 print("✓ DNIe card detected")
+
+                # Get serial hash BEFORE authenticating
+                dnie_hash = card.get_serial_hash()
+                print(f"✓ DNIe identified: {dnie_hash[:8]}...")
                 break  # Card detected, exit retry loop
                 
             except DNIeCardError as e:
@@ -248,7 +306,62 @@ def prompt_and_verify_two_factor():
             else:
                 break
         
-        # Card detected, now authenticate with PIN and get signature
+        # STEP 2: Verify that the DNIe is registered
+        if not is_dnie_registered(dnie_hash):
+            print("\n" + "="*80)
+            print("✗ DNIe NOT REGISTERED")
+            print("="*80)
+            print(f"\nThis DNIe ({dnie_hash[:8]}...) is not registered in the system.")
+            print("Would you like to initialize a new database for this DNIe?")
+            
+            choice = input("\n(i)nitialize new database, or (q)uit? [i/q]: ").strip().lower()
+            
+            card.disconnect()
+            
+            if choice == 'i' or choice == '':
+                # Redirect to initialization
+                print("\nStarting database initialization...\n")
+                from sys import exit as sys_exit
+                result = init_database()
+                if result:
+                    print("\n✓ Initialization complete! You can now use the password manager.")
+                    sys_exit(0)
+                else:
+                    print("\n✗ Initialization cancelled or failed.")
+                    sys_exit(1)
+            else:
+                print("Exiting password manager.")
+                return None
+        
+        print("✓ DNIe registered in the system")
+
+        # Get user_id from registry
+        user_id = get_user_id_from_dnie(dnie_hash)
+        if not user_id:
+            print("✗ Error: Could not retrieve user_id from registry")
+            card.disconnect()
+            return None
+    
+        # Update last login timestamp
+        update_last_login(dnie_hash)
+
+        # STEP 3: Get user-specific file names
+        salt_file = get_salt_filename(user_id)
+        wrapped_key_file = get_wrapped_key_filename(user_id)
+        db_file = get_db_filename(user_id)
+
+        # Verify that files exist
+        if not os.path.exists(salt_file) or not os.path.exists(wrapped_key_file):
+            print(f"\n✗ Error: Configuration files not found for this DNIe.")
+            print("Database may be corrupted.")
+            card.disconnect()
+            return None
+        
+        # Load user-specific salt
+        with open(salt_file, 'rb') as f:
+            salt = f.read()
+
+        # STEP 4: Authentication (PIN + Master Password)
         try:
             pin = input_password_masked("Enter DNIe PIN: ")
             dnie_wrapping_key = card.authenticate(pin)  # This signs the challenge
@@ -294,10 +407,11 @@ def prompt_and_verify_two_factor():
         password_key = derive_key_from_password(password, salt)
         del password  # Remove reference to password
 
+        # Attempt to decrypt
         try:
             # Load wrapped K_db from file
             print("\nUnwrapping database key...")
-            with open(WRAPPED_KEY_FILE, 'rb') as f:
+            with open(wrapped_key_file, 'rb') as f:
                 wrapped_k_db = f.read()
             
             # Unwrap K_db using DNIe + password keys
@@ -311,8 +425,8 @@ def prompt_and_verify_two_factor():
             try:
                 print("Verifying database key...")
                 
-                # Just verify we can decrypt - don't keep the data!
-                with open(DB_FILENAME, 'rb') as f:
+                # Just verifying we can decrypt - don't keeping the data
+                with open(db_file, 'rb') as f:
                     encrypted = f.read()
                 
                 fernet = Fernet(k_db)
@@ -330,7 +444,7 @@ def prompt_and_verify_two_factor():
                 print("=" * 80)
                 
                 # Return ONLY k_db (as bytearray for session management)
-                return bytearray(k_db)
+                return bytearray(k_db), user_id
             
             except Exception as e:
                 print(f"✗ Authentication failed. Incorrect credentials or corrupted database.")
@@ -359,75 +473,100 @@ def generate_salt():
     """Generate a cryptographically secure random salt."""
     return os.urandom(16)
 
-def save_salt(salt):
-    """Save salt to file."""    
-    with open(SALT_FILE, 'wb') as f:
-        f.write(salt)
-    # Secure permissions immediately
-    secure_file_permissions(SALT_FILE)
-
-def load_salt():
-    """Load salt from file."""
-    with open(SALT_FILE, 'rb') as f:
-        return f.read()
-
 def init_database():
     """Initialize database with random K_db protected by DNIe signature + password."""
-    if os.path.exists(SALT_FILE) or os.path.exists(WRAPPED_KEY_FILE):
-        print("Database already initialized. Reset database to start fresh.")
-        return None
-    
     print("=" * 80)
     print("INITIALIZING PASSWORD MANAGER - SIGNATURE CHALLENGE")
     print("=" * 80)
-    print("\n📋 This will:")
-    print("  1. Generate a random database key (K_db)")
-    print("  2. Sign a challenge with your DNIe to derive wrapping key")
-    print("  3. Derive a key from your master password")
-    print("  4. Wrap K_db with combined DNIe + password keys")
-    print("  5. Encrypt database with K_db")
-    print()
-    
-    # Initialize variables to None for cleanup tracking
-    dnie_wrapping_key = None
-    password_key = None
-    k_db = None
-    wrapped_k_db = None
-    
-    # Step 1: DNIe Signature Challenge with retry loop
-    print("\nSTEP 1: DNIe Signature Challenge")
-    print("Please insert your DNIe card into the reader...")
+    # STEP 1: Connect and get DNIe hash
+    print("\nInsert the DNIe you'll use for this database...")
     
     card = None
-    dnie_wrapping_key = None
+    dnie_hash = None
     
-    # Card detection retry loop
     while True:
         try:
             card = DNIeCard()
             card.connect()
-            print("✓ DNIe card detected")
-            break  # Card detected, exit retry loop
+            print("✓ DNIe detected")
+            
+            dnie_hash = card.get_serial_hash()
+            print(f"✓ DNIe identified: {dnie_hash[:8]}...")
+            break
             
         except DNIeCardError as e:
-            if "not detected" in str(e).lower() or "no smart card" in str(e).lower():
-                print("⚠  Card not detected.")
-                retry = input("Press Enter to retry, or 'q' to cancel initialization: ").strip().lower()
+            if "not detected" or "no smart card" in str(e).lower():
+                retry = input("⚠ DNIe not detected. [Enter] retry, [q] cancel: ").strip().lower()
                 if retry == 'q':
                     print("Initialization cancelled.")
                     return None
-                continue  # Retry card detection
+                continue
             else:
-                # Other DNIe errors
                 print(f"✗ DNIe error: {e}")
-                print("Initialization failed.")
                 return None
-        except Exception as e:
-            print(f"✗ Error: {e}")
-            print("Initialization failed.")
-            return None
     
-    # Card detected, now authenticate with PIN
+    # Determine user_id
+    if is_dnie_registered(dnie_hash):
+        user_id = get_user_id_from_dnie(dnie_hash)
+        print(f"\n⚠ This DNIe is already registered as: {user_id}")
+    else:
+        user_id = get_next_user_id()
+        print(f"\n✓ New user: {user_id}")
+
+    # Get user-specific file names
+    salt_file = get_salt_filename(user_id)
+    wrapped_key_file = get_wrapped_key_filename(user_id)
+    db_file = get_db_filename(user_id)
+
+    # STEP 2: Check if database already exists for this DNIe
+    if os.path.exists(salt_file) or os.path.exists(wrapped_key_file):
+        print(f"\n⚠ A database already exists for this user.")
+        
+        response = input("\nDo you want to OVERWRITE? (YOU'LL LOSE ALL DATA) [yes/no]: ").strip().lower()
+        
+        if response not in ['yes', 'y']:
+            print("Initialization cancelled.")
+            card.disconnect()
+            return None
+        
+        print("\n⚠ WARNING: All current data will be deleted.")
+        confirm = input("Type 'DELETE ALL' to confirm: ").strip()
+        
+        if confirm != 'DELETE ALL':
+            print("Initialization cancelled.")
+            card.disconnect()
+            return None
+        
+    # STEP 3: Request description for new registration
+    is_new_registration = not is_dnie_registered(dnie_hash)
+
+    if is_new_registration:
+        print(f"\n✓ New DNIe registration")
+        
+        while True:
+            description = input("Enter a description for this DNIe (optional, e.g., 'Work Laptop', 'Personal'): ").strip()
+            
+            # Use default if empty
+            if not description:
+                description = f"User {user_id}"
+                print(f"Using default description: {description}")
+                break
+            
+            # Validate description length
+            elif len(description) > 50:
+                print("⚠ Description too long (max 50 characters). Please try again.")
+                continue
+            
+            # Check for valid characters (optional)
+            elif not all(c.isalnum() or c.isspace() or c in "-_.,'" for c in description):
+                print("⚠ Description contains invalid characters. Use only letters, numbers, spaces, and -_.,")
+                continue
+            
+            else:
+                print(f"✓ Description set: {description}")
+                break
+    
+    # STEP 4: Authenticate with PIN
     try:
         pin = input_password_masked("Enter DNIe PIN: ")
         dnie_wrapping_key = card.authenticate(pin)
@@ -452,10 +591,9 @@ def init_database():
             pass
         return None
     
-    # Step 2: Password Key Derivation
-    print("\nSTEP 2: Master Password Setup")
+    # STEP 5: Configure master password
+    print("\nMaster Password Setup...")
     salt = generate_salt()
-    save_salt(salt)
     
     password = prompt_master_password()
     
@@ -464,41 +602,48 @@ def init_database():
         del password  # Remove reference to password
         print("✓ Password key derived")
         
-        # Step 3: Generate random K_db
+        # Step 6: Generate random K_db
         print("STEP 3: Generating random database key...")
         k_db = Fernet.generate_key()  # Random 32-byte key
         print(f"✓ Generated K_db ({len(k_db)} bytes)")
 
-        # Step 4: Wrap K_db
+        # Step 7: Wrap K_db
         print("\nSTEP 4: Wrapping database key...")
         wrapped_k_db = wrap_database_key(k_db, dnie_wrapping_key, password_key)
         del dnie_wrapping_key   # Remove reference to DNIe key
         del password_key     # Remove reference to password key
         
-        # Save wrapped K_db
-        with open(WRAPPED_KEY_FILE, 'wb') as f:
-            f.write(wrapped_k_db)
-        del wrapped_k_db  # Remove reference to wrapped key
-        # Secure permissions immediately
-        secure_file_permissions(WRAPPED_KEY_FILE)
-        print(f"✓ K_db wrapped and saved to {WRAPPED_KEY_FILE}")
+        # Save user-specific files
+        with open(salt_file, 'wb') as f:
+            f.write(salt)
+        secure_file_permissions(salt_file)
         
-        # Step 5: Create empty database encrypted with K_db
+        with open(wrapped_key_file, 'wb') as f:
+            f.write(wrapped_k_db)
+        del wrapped_k_db
+        secure_file_permissions(wrapped_key_file)
+        
+        # Step 8: Create empty database encrypted with K_db
         print("\nSTEP 5: Creating encrypted database...")
         empty_db = {}
-        save_database(empty_db, k_db)
+        save_database(empty_db, k_db, db_file)
         print("✓ Database created and encrypted with K_db")
         
-        print("\n" + "=" * 80)
-        print("✓ INITIALIZATION COMPLETE!")
-        print("=" * 80)
-        print("\n🔐 Your database is protected by:")
-        print("  • Random K_db (stored encrypted)")
-        print("  • DNIe signature challenge (requires card + PIN)")
-        print("  • Master password (Argon2id-derived key)")
+        # STEP 9: Register DNIe in registry (ADD THIS)
+        if is_new_registration:
+            register_dnie(dnie_hash, user_id, description)
+            print(f"✓ DNIe registered in system")
 
-        # Return k_db for immediate session start
-        return bytearray(k_db)
+            print("\n" + "=" * 80)
+            print("✓ INITIALIZATION COMPLETE!")
+            print("=" * 80)
+            print("\n🔐 Your database is protected by:")
+            print("  • Random K_db (stored encrypted)")
+            print("  • DNIe signature challenge (requires card + PIN)")
+            print("  • Master password (Argon2id-derived key)")
+
+        # Return immediate session start
+        return (bytearray(k_db), user_id)
     
     except Exception as e:
         print(f"\n✗ Initialization failed: {e}")
@@ -516,12 +661,12 @@ def init_database():
             del password
         # Clean up partial files if initialization failed
         try:
-            if os.path.exists(WRAPPED_KEY_FILE):
-                os.remove(WRAPPED_KEY_FILE)
-            if os.path.exists(SALT_FILE):
-                os.remove(SALT_FILE)
-            if os.path.exists(DB_FILENAME):
-                os.remove(DB_FILENAME)
+            if os.path.exists(wrapped_key_file):
+                os.remove(wrapped_key_file)
+            if os.path.exists(salt_file):
+                os.remove(salt_file)
+            if os.path.exists(db_file):
+                os.remove(db_file)
         except:
             pass
     
@@ -712,32 +857,31 @@ def show_enhanced_help():
 """)
 
 
-def run_session(timeout_minutes, initial_k_db=None):
+def run_session(timeout_minutes, initial_result=None):
     """
     Main interactive session with two-factor authentication (DNIe + Password).
     Uses SecureSession for automatic memory locking and cleanup.
     """
-    if not os.path.exists(SALT_FILE):
-        print("No database found.")
-        return
     
     # Create command parser for interactive mode
     cmd_parser = create_command_parser()
     
-    # Authenticate or use provided keys
-    if initial_k_db is not None:
-        # Keys provided from initialization - use them directly
-        k_db = initial_k_db
+    if initial_result is not None:
+        # Result provided from initialization - use directly
+        k_db, user_id = initial_result
     else:
-        # Normal two-factor authentication (DNIe + Password)
-        k_db = prompt_and_verify_two_factor()
-        if k_db is None:
+        # Normal two-factor authentication
+        result = prompt_and_verify_two_factor()
+        if result is None:
             return
+        k_db, user_id = result
     
     with SecureSession(timeout_minutes=timeout_minutes) as session:     
         # Store in session for management
         session.fernet_key = k_db
+        session.user_id = user_id
         del k_db  # Remove reference to original k_db
+        del user_id 
         session.last_auth = datetime.now()
 
         # Lock it in memory
@@ -753,13 +897,25 @@ def run_session(timeout_minutes, initial_k_db=None):
         expiry_stop = auto_expire_session(session, check_interval=30)
 
         # Create on-demand database wrapper
-        encrypted_db = EncryptedDatabase(bytes(session.fernet_key))
+        db_file = get_db_filename(session.user_id)
+        encrypted_db = EncryptedDatabase(bytes(session.fernet_key), db_filename=db_file)
+
+        # Get user info from registry for display
+        registry = load_dnie_registry()
+        dnie_info = registry.get('dnies', {})
+        user_description = "Unknown User"
+        for dnie_hash, info in dnie_info.items():
+            if info.get('user_id') == session.user_id:
+                user_description = info.get('description', session.user_id)
+                break
 
         print(f"\n{'=' * 80}")
         print(f"PASSWORD MANAGER - SESSION ACTIVE")
         print(f"{'=' * 80}")
+        print(f"User: {session.user_id} ({user_description})")
         print(f"Authentication: Two-Factor (DNIe + Password)")
         print(f"Session timeout: {timeout_minutes} minutes")
+        print(f"Database: {db_file}")
         print(f"Commands: add, edit, list, show, copy, delete, backup, restore, lock, init, destroy-db, exit, help")
         print(f"{'=' * 80}\n")
         
@@ -781,13 +937,22 @@ def run_session(timeout_minutes, initial_k_db=None):
                     print("\n⏱  Session expired. Re-authentication required.")
                     encrypted_db.clear()
                     
-                    k_db = prompt_and_verify_two_factor()
+                    result = prompt_and_verify_two_factor()
                     
-                    if k_db is None:
+                    if result is None:
                         print("Re-authentication failed. Ending session.")
-                        del k_db
                         break
-                    
+                    k_db, user_id = result
+
+                    # Verify it's the same user
+                    if user_id != session.user_id:
+                        print(f"✗ Error: Different DNIe detected (expected {session.user_id}, got {user_id})")
+                        print("Cannot continue session with different user. Ending session.")
+                        del k_db
+                        del user_id
+                        break
+                    del user_id  # No longer needed
+
                     session.clear_key()
                     session.fernet_key = k_db
                     del k_db  # Remove reference to temporary result
@@ -804,7 +969,8 @@ def run_session(timeout_minutes, initial_k_db=None):
                     session.last_auth = datetime.now()
 
                     # Create new database wrapper with new key
-                    encrypted_db = EncryptedDatabase(bytes(session.fernet_key))
+                    db_file = get_db_filename(session.user_id)
+                    encrypted_db = EncryptedDatabase(bytes(session.fernet_key), db_filename=db_file)
                     print("✓ Re-authenticated successfully.\n")
                 
                 # Handle help command with optional specific command
@@ -1073,12 +1239,12 @@ def run_session(timeout_minutes, initial_k_db=None):
                         print(f"✗ Failed to delete entry for '{args.service}'.")
                 
                 elif cmd == 'backup':
-                    ok = backup_database()
+                    ok = backup_database(session.user_id)
                     print("Backup created." if ok else "Backup failed.")
                     session.last_auth = datetime.now()
                 
                 elif cmd == 'restore':
-                    ok = restore_database()
+                    ok = restore_database(session.user_id)
                     if ok:
                         encrypted_db.reload_from_disk()
                         print("✓ Database restored from backup.")
@@ -1088,11 +1254,56 @@ def run_session(timeout_minutes, initial_k_db=None):
                 
                 elif cmd == 'lock':
                     print("🔒 Session locked. All sensitive data cleared from memory.")
-                    # Force immediate re-authentication by expiring session
-                    session.last_auth = datetime.min
-                    # The next iteration will trigger re-authentication
-                    # Clear the database from memory for extra security
+                    
+                    # Stop the background expiry thread
+                    expiry_stop.set()
+                    
+                    # Clear sensitive data
                     encrypted_db.clear()
+                    session.clear_key()
+                    session.last_auth = None
+                    
+                    # Re-authenticate immediately
+                    print("\nRe-authentication required to unlock session.")
+                    result = prompt_and_verify_two_factor()
+                    if result is None:
+                        print("Re-authentication failed. Ending session.")
+                        break
+                    
+                    k_db, user_id = result
+                    
+                    # Verify same user
+                    if user_id != session.user_id:
+                        print(f"✗ Error: Different DNIe detected")
+                        del k_db
+                        del user_id
+                        break
+                    
+                    del user_id
+                    
+                    # Restore session
+                    session.fernet_key = k_db
+                    del k_db
+                    
+                    # Lock key in memory
+                    if len(session.fernet_key) <= MAX_MLOCK_SIZE_LINUX:
+                        try:
+                            mlock(session.fernet_key)
+                            session._key_locked = True
+                        except Exception as e:
+                            print(f"Note: Could not lock key in memory: {e}")
+                            session._key_locked = False
+                    
+                    session.last_auth = datetime.now()
+                    
+                    # Restart expiry thread
+                    expiry_stop = auto_expire_session(session, check_interval=30)
+                    
+                    # Recreate database wrapper
+                    db_file = get_db_filename(session.user_id)
+                    encrypted_db = EncryptedDatabase(bytes(session.fernet_key), db_filename=db_file)
+                    
+                    print("✓ Session unlocked successfully.\n")
                     continue
                 
                 elif cmd == 'init':
@@ -1102,20 +1313,64 @@ def run_session(timeout_minutes, initial_k_db=None):
                         continue
                     
                     # Re-authenticate before reinit
-                    k_db = prompt_and_verify_two_factor()
-                    if k_db is None:
-                        print("Re-authentication failed. Cannot reinitialize.")
+                    result = prompt_and_verify_two_factor()
+                    if result is None:
+                        print("Re-authentication failed.")
                         break
-                    del k_db  # Clean, we don't need this key
                     
-                    # Securely delete old database files before re-init
-                    destroy_database_files()
+                    auth_k_db, auth_user_id = result
+                    del auth_k_db
                     
+                    # Verify it's the same user trying to reinit their own database
+                    if auth_user_id != session.user_id:
+                        print(f"✗ Error: Cannot reinit database of different user")
+                        del auth_user_id
+                        continue
+                    
+                    # Get DNIe hash for this user to unregister it
+                    registry = load_dnie_registry()
+                    dnie_hash_to_remove = None
+                    for dnie_hash, info in registry.get('dnies', {}).items():
+                        if info.get('user_id') == auth_user_id:
+                            dnie_hash_to_remove = dnie_hash
+                            break
+
+                    del auth_user_id
+
+                        # Delete only this user's files
+                    user_files = [
+                        get_db_filename(session.user_id),
+                        get_salt_filename(session.user_id),
+                        get_wrapped_key_filename(session.user_id),
+                        get_backup_filename(session.user_id)
+                    ]
+                    
+                    destroy_database_files(session.user_id)
+                    
+                    # Unregister the DNIe from the registry
+                    if dnie_hash_to_remove:
+                        registry = load_dnie_registry()
+                        if dnie_hash_to_remove in registry.get('dnies', {}):
+                            del registry['dnies'][dnie_hash_to_remove]
+                            save_dnie_registry(registry)
+                            print(f"✓ DNIe unregistered from system")
+
                     # Call init_database() which now handles two-factor setup
-                    new_k_db = init_database()
-                    if new_k_db is None:
-                        print("Initialization failed. Ending session.")
+                    new_result = init_database()
+                    if new_result is None:
+                        print("Initialization failed.")
                         break
+                    
+                    new_k_db, new_user_id = new_result
+
+                    # Verify it's still the same user
+                    if new_user_id != session.user_id:
+                        print(f"✗ Error: User mismatch after init")
+                        del new_k_db
+                        del new_user_id
+                        break
+                    
+                    del new_user_id
 
                     # Update session with new key
                     session.clear_key()
@@ -1133,7 +1388,7 @@ def run_session(timeout_minutes, initial_k_db=None):
                     session.last_auth = datetime.now()
 
                     # Create new database wrapper with new key
-                    encrypted_db = EncryptedDatabase(bytes(session.fernet_key))
+                    encrypted_db = EncryptedDatabase(bytes(session.fernet_key), db_filename=db_file)
                     print("✓ Database re-initialized successfully.")
                 
                 elif cmd == 'destroy-db':
@@ -1142,16 +1397,57 @@ def run_session(timeout_minutes, initial_k_db=None):
                         print("Destruction aborted: confirmation did not match.")
                         continue
                     
-                    # Force re-auth even if session active
-                    k_db = prompt_and_verify_two_factor()
-                    if k_db is None:
+                    # Force re-authentication before destruction
+                    result = prompt_and_verify_two_factor()
+                    if result is None:
                         print("Re-authentication failed. Cannot destroy database.")
                         break
-                    del k_db  # Remove reference to temporary result
+                    
+                    auth_k_db, auth_user_id = result
+                    del auth_k_db  # Don't need the key, just verify identity
 
-                    removed = destroy_database_files()
-                    print("Database files removed." if removed else "No database files found to remove.")
-                    break  # end session after destruction
+                    # Verify it's the same user trying to destroy their own database
+                    if auth_user_id != session.user_id:
+                        print(f"✗ Error: Cannot destroy database of different user")
+                        print(f"   Current session: {session.user_id}")
+                        print(f"   Authenticated as: {auth_user_id}")
+                        del auth_user_id
+                        continue
+                    
+                    del auth_user_id
+                    
+                    print(f"\n⚠ WARNING: About to permanently delete all data for user {session.user_id}")
+                    final_confirm = input("Type 'CONFIRM DELETE' to proceed: ").strip()
+                    if final_confirm != "CONFIRM DELETE":
+                        print("Destruction cancelled.")
+                        continue
+
+                    # Get DNIe hash for this user to unregister it
+                    registry = load_dnie_registry()
+                    dnie_hash_to_remove = None
+                    for dnie_hash, info in registry.get('dnies', {}).items():
+                        if info.get('user_id') == session.user_id:
+                            dnie_hash_to_remove = dnie_hash
+                            break
+
+                    # Destroy this user's database files
+                    removed = destroy_database_files(session.user_id)
+                    
+                    if removed:
+                        print("✓ Database files securely deleted.")
+                        # Unregister the DNIe from the registry
+                        if dnie_hash_to_remove:
+                            registry = load_dnie_registry()
+                            if dnie_hash_to_remove in registry.get('dnies', {}):
+                                del registry['dnies'][dnie_hash_to_remove]
+                                save_dnie_registry(registry)
+                                print(f"✓ DNIe unregistered from system")
+
+                        print("  Session will now end.")
+                    else:
+                        print("✗ No database files found to remove.")
+                    
+                    break  # End session after destruction
                 
                 elif cmd == 'help':
                     cmd_parser.print_help()
@@ -1170,23 +1466,23 @@ def main():
     # Secure all sensitive files on startup
     secure_all_sensitive_files()
 
-    # Check if database exists
-    if not os.path.exists(SALT_FILE) or not os.path.exists(WRAPPED_KEY_FILE):
+    # Check if database exists (verify registry)
+    if not os.path.exists(DNIE_REGISTRY_FILE) or len(load_dnie_registry().get('dnies', {})) == 0:
         # No database - run initialization
         print("=" * 80)
         print("WELCOME TO PASSWORD MANAGER")
         print("=" * 80)
         print("\nNo database found. Running first-time setup...\n")
         
-        k_db = init_database()
-        if k_db is None:
+        result = init_database()
+        if result is None:
             return
-        
+
         print("\n✓ Setup complete! Starting session...\n")
         
         # Start session with keys from init (skip authentication)
-        run_session(timeout_minutes=4, initial_k_db=k_db)
-        del k_db
+        run_session(timeout_minutes=4, initial_result=result)
+        del result
     else:
         # Normal session (will authenticate)
         run_session(timeout_minutes=4)

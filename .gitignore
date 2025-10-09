@@ -206,9 +206,9 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-# Sensitive data files
-passwords.db
-db_salt.bin
-passwords_backup.db
-wrapped_key.bin
+# Password Manager Data - SENSITIVE FILES
 password_manager.log
+data/
+*.db
+*.bin
+dnie_registry.json

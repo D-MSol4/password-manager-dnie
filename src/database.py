@@ -10,8 +10,11 @@ import logging
 import subprocess
 from cryptography.fernet import Fernet
 
-DB_FILENAME = "passwords.db"
-BACKUP_FILENAME = "passwords_backup.db"
+DATA_DIR = 'data'
+# Ensure data directory exists
+if not os.path.exists(DATA_DIR):
+    os.makedirs(DATA_DIR, mode=0o700)
+    print(f"Created data directory: {DATA_DIR}")
 
 LOCK = threading.Lock()  # basic concurrency control
 
@@ -20,6 +23,8 @@ password_pattern = re.compile(
     r'^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^\w\s])[\S]{16,60}$',
     re.UNICODE
 )
+
+DNIE_REGISTRY_FILE = os.path.join(DATA_DIR, 'dnie_registry.json')
 
 # Configure secure logging
 LOG_FILENAME = 'password_manager.log'
@@ -30,6 +35,33 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+# User-specific file naming (all in data folder)
+def load_dnie_registry():
+    registry_file = os.path.join(DATA_DIR, 'dnie_registry.json')
+    if not os.path.exists(registry_file):
+        return {"dnies": {}}
+    try:
+        with open(registry_file, 'r') as f:
+            return json.load(f)
+    except:
+        return {"dnies": {}}
+
+def get_db_filename(user_id):
+    '''Get database filename for a specific user'''
+    return os.path.join(DATA_DIR, f"passwords_{user_id}.db")
+
+def get_salt_filename(user_id):
+    '''Get salt filename for a specific user'''
+    return os.path.join(DATA_DIR, f"db_salt_{user_id}.bin")
+
+def get_wrapped_key_filename(user_id):
+    '''Get wrapped key filename for a specific user'''
+    return os.path.join(DATA_DIR, f"wrapped_key_{user_id}.bin")
+
+def get_backup_filename(user_id):
+    '''Get backup filename for a specific user'''
+    return os.path.join(DATA_DIR, f"passwords_backup_{user_id}.db")
 
 
 def is_valid_password(password: str) -> bool:
@@ -56,7 +88,7 @@ class EncryptedDatabase:
     Decrypts on-demand for operations, then immediately re-encrypts.
     """
     
-    def __init__(self, fernet_key):
+    def __init__(self, fernet_key, db_filename):
         """
         Initialize with encryption key.
         
@@ -64,13 +96,14 @@ class EncryptedDatabase:
             fernet_key: bytes - Fernet encryption key
         """
         self.fernet_key = fernet_key
+        self.db_filename = db_filename
         self.encrypted_data = None
         self._load_encrypted()
     
     def _load_encrypted(self):
         """Load encrypted database from disk (stays encrypted)."""
-        if os.path.exists(DB_FILENAME):
-            with open(DB_FILENAME, 'rb') as f:
+        if os.path.exists(self.db_filename):
+            with open(self.db_filename, 'rb') as f:
                 self.encrypted_data = f.read()
         else:
             # New database - create empty encrypted dict
@@ -96,9 +129,9 @@ class EncryptedDatabase:
     
     def _save_encrypted(self):
         """Save encrypted database to disk."""
-        with open(DB_FILENAME, 'wb') as f:
+        with open(self.db_filename, 'wb') as f:
             f.write(self.encrypted_data)
-        secure_file_permissions(DB_FILENAME)
+        secure_file_permissions(self.db_filename)
     
     # === READ OPERATIONS ===
     
@@ -240,7 +273,7 @@ class EncryptedDatabase:
         self.encrypted_data = None
 
 
-def save_database(db, fernet_key):
+def save_database(db, fernet_key, db_file):
     """Save database and secure permissions."""
     try:
         with LOCK:
@@ -250,11 +283,11 @@ def save_database(db, fernet_key):
             del fernet
             del db_bytes
             
-            with open(DB_FILENAME, 'wb') as f:
+            with open(db_file, 'wb') as f:
                 f.write(encrypted)
             del encrypted
             # Secure permissions immediately after creation
-            secure_file_permissions(DB_FILENAME)
+            secure_file_permissions(db_file)
             
             return True
     except Exception:
@@ -262,17 +295,19 @@ def save_database(db, fernet_key):
         return False
 
 
-def backup_database():
+def backup_database(user_id):
     """Backup database and secure permissions."""
     try:
         with LOCK:
-            if not os.path.exists(DB_FILENAME):
+            db_file = get_db_filename(user_id)
+            backup_file = get_backup_filename(user_id)
+            if not os.path.exists(db_file):
                 return False
             
-            shutil.copy2(DB_FILENAME, BACKUP_FILENAME)
+            shutil.copy2(db_file, backup_file)
             
             # Secure backup file permissions
-            secure_file_permissions(BACKUP_FILENAME)
+            secure_file_permissions(backup_file)
             
             return True
     except Exception:
@@ -280,12 +315,15 @@ def backup_database():
         return False
 
 
-def restore_database():
+def restore_database(user_id):
     """Restore the database from backup."""
     try:
         with LOCK:
-            if os.path.exists(BACKUP_FILENAME):
-                shutil.copy2(BACKUP_FILENAME, DB_FILENAME)
+            db_file = get_db_filename(user_id)
+            backup_file = get_backup_filename(user_id)
+
+            if os.path.exists(backup_file):
+                shutil.copy2(backup_file, db_file)
                 return True
             else:
                 return False
@@ -303,17 +341,17 @@ def restore_database():
         return False
 
 
-def destroy_database_files():
+def destroy_database_files(user_id):
     """Permanently delete ALL database-related files using secure deletion."""
     try:
         removed = False
         with LOCK:
-            # Define all files to delete
+            # Define user-specific files to delete
             files_to_delete = [
-                DB_FILENAME,           # passwords.db
-                BACKUP_FILENAME,       # passwords_backup.db
-                "db_salt.bin",         # Salt file
-                "wrapped_key.bin"      # Wrapped K_db
+                get_db_filename(user_id),         # passwords_userXXX.db
+                get_backup_filename(user_id),     # passwords_backup_userXXX.db
+                get_salt_filename(user_id),       # db_salt_userXXX.bin
+                get_wrapped_key_filename(user_id) # wrapped_key_userXXX.bin
             ]
             
             for file_path in files_to_delete:
@@ -443,16 +481,31 @@ def secure_file_permissions(filepath):
 
 
 def secure_all_sensitive_files():
-    """Secure permissions on all sensitive files in the database."""
-    sensitive_files = [
-        DB_FILENAME,              # passwords.db
-        BACKUP_FILENAME,          # passwords_backup.db
-        "wrapped_key.bin",        # Wrapped database key
-        "db_salt.bin",            # Password salt
-        LOG_FILENAME              # password_manager.log
-    ]
+    """
+    Secure permissions on all sensitive files in the database.
+    Updated to handle multi-user files.
+    """
+    # Secure registry file
+    if os.path.exists(DNIE_REGISTRY_FILE):
+        secure_file_permissions(DNIE_REGISTRY_FILE)
     
-    for filepath in sensitive_files:
-        if os.path.exists(filepath):
-            secure_file_permissions(filepath)
+    # Secure log file
+    if os.path.exists(LOG_FILENAME):
+        secure_file_permissions(LOG_FILENAME)
+    
+    # Secure all user-specific files
+    registry = load_dnie_registry()
+    for dnie_hash, info in registry.get('dnies', {}).items():
+        user_id = info.get('user_id')
+        if user_id:
+            user_files = [
+                get_db_filename(user_id),         # passwords_userXXX.db
+                get_backup_filename(user_id),     # passwords_backup_userXXX.db
+                get_salt_filename(user_id),       # db_salt_userXXX.bin
+                get_wrapped_key_filename(user_id) # wrapped_key_userXXX.bin
+            ]
+            
+            for filepath in user_files:
+                if os.path.exists(filepath):
+                    secure_file_permissions(filepath)
 

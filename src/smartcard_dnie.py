@@ -63,6 +63,32 @@ class DNIeCard:
         except Exception as e:
             raise DNIeCardError(f"Failed to connect to DNIe: {e}")
     
+    # Constante de separación de dominio específica de la aplicación
+    DOMAIN_SEPARATOR = b"PasswordManager-DNIe-v1.0"
+    
+    def get_serial_hash(self):
+        '''
+        Obtiene el hash SHA-256 del número de serie con domain separator.
+        
+        Returns:
+            str: Hash hexadecimal (64 caracteres)
+        '''
+        if not self.token:
+            raise DNIeCardError("Not connected to card")
+        
+        card_serial = self.token.serial
+        serial_bytes = card_serial.encode('utf-8') if isinstance(card_serial, str) else card_serial
+        
+        # Concatenar: DOMAIN_SEPARATOR || serial_bytes
+        data_to_hash = self.DOMAIN_SEPARATOR + serial_bytes
+        
+        # Calcular SHA-256
+        digest = hashes.Hash(hashes.SHA256(), backend=default_backend())
+        digest.update(data_to_hash)
+        hash_bytes = digest.finalize()
+        
+        return hash_bytes.hex()
+
     def authenticate(self, pin):
         """
         Authenticate with PIN using signature challenge.
