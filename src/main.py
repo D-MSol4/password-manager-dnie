@@ -325,10 +325,10 @@ def prompt_and_verify_two_factor():
                 result = init_database()
                 if result:
                     print("\n✓ Initialization complete! You can now use the password manager.")
-                    sys_exit(0)
+                    return result
                 else:
                     print("\n✗ Initialization cancelled or failed.")
-                    sys_exit(1)
+                    return None
             else:
                 print("Exiting password manager.")
                 return None
