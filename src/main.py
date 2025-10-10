@@ -228,16 +228,30 @@ def auto_expire_session(session, check_interval=30):
 
 def prompt_master_password():
     """
-    Prompt for master password with validation.
+    Prompt for master password with validation and confirmation.
+    Requires the user to enter the password twice to confirm.
     """
     while True:
         password = input_password_masked(prompt="Enter master password: ")
-        if is_valid_password(password):
-            print("Password accepted.")
-            return password
-        else:
+        
+        if not is_valid_password(password):
             del password  # Remove invalid password reference
             print("Invalid password. Password must be 16-60 chars with uppercase, lowercase, digits, and symbols. Try again.\n")
+            continue
+        
+        # Ask for confirmation
+        password_confirm = input_password_masked(prompt="Confirm master password: ")
+        
+        if password == password_confirm:
+            print("Password accepted.")
+            del password_confirm  # Clean up confirmation
+            return password
+        else:
+            print("✗ Passwords do not match. Please try again.\n")
+            del password  # Clean up original password
+            del password_confirm  # Clean up confirmation
+            # Loop continues, asking for password from the beginning
+
 
 def prompt_and_verify_two_factor():
     """
