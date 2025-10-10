@@ -114,92 +114,71 @@ def get_next_user_id():
     next_id = max(existing_ids, default=0) + 1
     return f"user{next_id:03d}"
 
-
-class SecureSession:
+class Session:
     """
-    Enhanced Session class with Zeroize integration.
-    Locks sensitive data in memory to prevent swapping to disk.
+    Enhanced Session class with Zeroize integration and key rotation support.
+    Stores wrapping keys for automatic K_db rotation on logout.
     """
-
-    def __init__(self, timeout_minutes=DEFAULT_SESSION_MINUTES):
+    
+    def __init__(self, fernet_key, user_id, dnie_wrapping_key, password_key, timeout_minutes=DEFAULT_SESSION_MINUTES):
         self.timeout = timedelta(minutes=timeout_minutes)
-        self.fernet_key = None
-        self.last_auth = None
-        self._key_locked = False  # Track if memory is locked
-
+        self.fernet_key = bytearray(fernet_key)
+        self.user_id = user_id
+        self.last_auth = datetime.now()
+        self.key_locked = False
+        
+        # Store wrapping keys for auto-rotation on logout
+        self.dnie_wrapping_key = bytearray(dnie_wrapping_key)
+        self.password_key = bytearray(password_key)
+        
     def expired(self):
         """Check if the session has expired."""
         return self.last_auth is None or datetime.now() - self.last_auth > self.timeout
-
+    
     def clear_key(self):
-        """Securely clear and unlock the stored Fernet key."""
+        """Securely clear and unlock all stored keys."""
         if self.fernet_key is not None:
             try:
-                # Ensure key is bytearray before zeroizing
                 if isinstance(self.fernet_key, bytearray):
-                    # Unlock memory if it was locked (BEFORE zeroizing)
-                    if self._key_locked:
+                    if self.key_locked:
                         try:
                             munlock(self.fernet_key)
                         except Exception as e:
                             print(f"Warning: Failed to unlock key: {e}")
-                        self._key_locked = False
-
-                    # Now zeroize
+                        self.key_locked = False
                     zeroize1(self.fernet_key)
-                else:
-                    # Should not happen if ensure_unlocked is correct,
-                    # but handled just in case
-                    print("Warning: Fernet key is not bytearray, cannot zeroize properly")
             except Exception as e:
-                print(f"Warning: Failed to securely clear key: {e}")
+                print(f"Warning: Failed to securely clear fernet key: {e}")
             finally:
                 self.fernet_key = None
-
-    def ensure_unlocked(self, load_salt_fn, derive_fn, prompt_fn):
-        """
-        Ensure session is authenticated and return the Fernet key.
-        Uses memory locking to prevent key from being swapped to disk.
-        """
-        if self.expired():
-            # Clear old key before creating new one
-            self.clear_key()
-
-            # Get salt and password
-            salt = load_salt_fn()
-            password = prompt_fn()
-
-            # Derive key from password
-            key_bytes = derive_fn(password, salt)
-            # Remove reference to original password
-            del password
-
-            # Encode for Fernet (still as bytearray)
-            self.fernet_key = bytearray(base64.urlsafe_b64encode(key_bytes))
-            del key_bytes  # Remove reference to original key bytes
-
-            # Lock the final Fernet key in memory
-            if len(self.fernet_key) <= MAX_MLOCK_SIZE_LINUX:
-                try:
-                    mlock(self.fernet_key)
-                    self._key_locked = True
-                except Exception as e:
-                    print(f"Note: Could not lock fernet key memory: {e}")
-                    self._key_locked = False
-
-            self.last_auth = datetime.now()
-
-        # Return as bytes for compatibility with Fernet
-        return bytes(self.fernet_key)
-
+        
+        # Clear wrapping keys
+        if self.dnie_wrapping_key is not None:
+            try:
+                if isinstance(self.dnie_wrapping_key, bytearray):
+                    zeroize1(self.dnie_wrapping_key)
+            except Exception as e:
+                print(f"Warning: Failed to clear DNIe wrapping key: {e}")
+            finally:
+                self.dnie_wrapping_key = None
+                
+        if self.password_key is not None:
+            try:
+                if isinstance(self.password_key, bytearray):
+                    zeroize1(self.password_key)
+            except Exception as e:
+                print(f"Warning: Failed to clear password key: {e}")
+            finally:
+                self.password_key = None
+    
     def __del__(self):
-        """Ensure key is cleared when session is destroyed."""
+        """Ensure keys are cleared when session is destroyed."""
         self.clear_key()
-
+    
     def __enter__(self):
         """Context manager entry."""
         return self
-
+    
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Context manager exit - secure cleanup."""
         self.clear_key()
@@ -430,8 +409,8 @@ def prompt_and_verify_two_factor():
             
             # Unwrap K_db using DNIe + password keys
             k_db = unwrap_database_key(wrapped_k_db, dnie_wrapping_key, password_key)
-            del dnie_wrapping_key
-            del password_key
+            # NOTE: Do NOT delete dnie_wrapping_key and password_key here
+            # They are needed for key rotation and must be returned to the session
             del wrapped_k_db
             print("✓ K_db unwrapped successfully")
             
@@ -456,9 +435,14 @@ def prompt_and_verify_two_factor():
                 
                 print("\n✓ TWO-FACTOR AUTHENTICATION SUCCESSFUL!")
                 print("=" * 80)
-                
-                # Return ONLY k_db (as bytearray for session management)
-                return bytearray(k_db), user_id
+
+                # Return all keys needed for session (k_db + wrapping keys for rotation)
+                return (
+                    bytearray(k_db), 
+                    user_id, 
+                    bytearray(dnie_wrapping_key), 
+                    bytearray(password_key)
+                )
             
             except Exception as e:
                 print(f"✗ Authentication failed. Incorrect credentials or corrupted database.")
@@ -481,6 +465,81 @@ def prompt_and_verify_two_factor():
     print(f"\n✗ Authentication failed after {MAX_ATTEMPTS} attempts.")
     print("Exiting for security.")
     return None
+
+def auto_rotate_on_logout(session):
+    """
+    Automatically rotate K_db on logout for forward secrecy.
+    
+    Steps:
+    1. Generate new random K_db
+    2. Decrypt database with old K_db
+    3. Re-encrypt database with new K_db
+    4. Wrap new K_db with stored wrapping keys
+    5. Save new wrapped key
+    
+    Args:
+        session: Active session object containing keys
+        
+    Returns:
+        bool: True if rotation succeeded, False otherwise
+    """
+    try:
+        # Get files
+        db_file = get_db_filename(session.user_id)
+        wrapped_key_file = get_wrapped_key_filename(session.user_id)
+        
+        if not os.path.exists(db_file):
+            print("✗ Database file not found. Skipping rotation.")
+            return False
+        
+        # Step 1: Generate new random K_db
+        k_db_new_raw = Fernet.generate_key()
+        k_db_new = bytearray(k_db_new_raw)
+        del k_db_new_raw
+        
+        # Step 2: Load and decrypt database with old K_db
+        k_db_old = bytes(session.fernet_key)
+        fernet_old = Fernet(k_db_old)
+        
+        with open(db_file, 'rb') as f:
+            encrypted_data_old = f.read()
+        
+        decrypted_data = fernet_old.decrypt(encrypted_data_old)
+        del fernet_old
+        del encrypted_data_old
+        
+        # Step 3: Re-encrypt with new K_db
+        fernet_new = Fernet(bytes(k_db_new))
+        encrypted_data_new = fernet_new.encrypt(decrypted_data)
+        del fernet_new
+        del decrypted_data
+        
+        # Step 4: Wrap new K_db with stored wrapping keys
+        wrapped_k_db_new = wrap_database_key(
+            bytes(k_db_new),
+            bytes(session.dnie_wrapping_key),
+            bytes(session.password_key)
+        )
+        
+        # Step 5: Save new wrapped key and encrypted database
+        with open(wrapped_key_file, 'wb') as f:
+            f.write(wrapped_k_db_new)
+        secure_file_permissions(wrapped_key_file)
+        
+        with open(db_file, 'wb') as f:
+            f.write(encrypted_data_new)
+        secure_file_permissions(db_file)
+        
+        # Cleanup
+        del k_db_new
+        del wrapped_k_db_new
+        del encrypted_data_new
+        
+        return True
+        
+    except Exception as e:
+        print(f"✗ Key rotation failed: {e}")
+        return False
 
 
 def generate_salt():
@@ -882,20 +941,20 @@ def run_session(timeout_minutes, initial_result=None):
     
     if initial_result is not None:
         # Result provided from initialization - use directly
-        k_db, user_id = initial_result
+        k_db, user_id, dnie_wrapping_key, password_key = initial_result
     else:
         # Normal two-factor authentication
         result = prompt_and_verify_two_factor()
         if result is None:
             return
-        k_db, user_id = result
+        k_db, user_id, dnie_wrapping_key, password_key = result
     
-    with SecureSession(timeout_minutes=timeout_minutes) as session:     
-        # Store in session for management
-        session.fernet_key = k_db
-        session.user_id = user_id
-        del k_db  # Remove reference to original k_db
-        del user_id 
+    with Session(k_db, user_id, dnie_wrapping_key, password_key, timeout_minutes=timeout_minutes) as session:     
+        # Limpiar referencias temporales (el constructor de Session ya las copió)
+        del k_db
+        del user_id
+        del dnie_wrapping_key
+        del password_key
         session.last_auth = datetime.now()
 
         # Lock it in memory
@@ -944,6 +1003,17 @@ def run_session(timeout_minutes, initial_result=None):
                     continue
                 
                 if line in ("exit", "quit"):
+                    print("\n🔒 Cerrando sesión de forma segura...")
+                    print("🔄 Rotando clave de base de datos automáticamente...")
+                    
+                    success = auto_rotate_on_logout(session)
+                    
+                    if success:
+                        print("✓ Base de datos protegida con nueva clave aleatoria")
+                        print("✓ Forward secrecy: clave anterior invalidada")
+                    else:
+                        print("⚠ Rotación de clave no completada (base de datos sigue accesible)")
+                    
                     break
                 
                 # Re-authenticate if session expired
