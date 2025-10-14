@@ -1,12 +1,12 @@
 import argparse
 import os
-import base64
 import sys
 import shlex
 import json
 import pyperclip
 import time
 import threading
+import msvcrt
 from datetime import datetime, timedelta
 from cryptography.fernet import Fernet
 from crypto import derive_key_from_password, unwrap_database_key, wrap_database_key
@@ -16,38 +16,57 @@ from database import (
     get_db_filename, get_salt_filename, get_wrapped_key_filename, get_backup_filename, load_dnie_registry
 )
 from smartcard_dnie import DNIeCard, DNIeCardError
+
+# Símbolos adaptativos según el terminal
+if sys.platform == 'win32' and 'WT_SESSION' not in os.environ:
+    # cmd.exe tradicional - usar ASCII
+    CHECK = '[OK]'
+    CROSS = '[X]'
+    WARNING = '[!]'
+else:
+    # Windows Terminal, Linux, Mac - usar Unicode
+    CHECK = '✓'
+    CROSS = '✗'
+    WARNING = '⚠'
+
 # Import secure memory handling
 try:
     from zeroize import zeroize1, mlock, munlock
 except ImportError:
-    print("[X] CRITICAL ERROR: zeroize library is required but not installed.")
+    print(f"{CROSS} CRITICAL ERROR: zeroize library is required but not installed.")
     print("Install it with: pip install zeroize")
     print("Exiting for security reasons.")
     import sys
     sys.exit(1)
 
-# Masked password input with fallback
-try:
-    import maskpass
+def input_password_masked(prompt="Password: "):
+    """Get password with masking using msvcrt.getwch() for proper Unicode support."""
+    print(prompt, end='', flush=True)
+    password = ""
     
-    def input_password_masked(prompt='Password: '):
-        """Get password with masking using maskpass library."""
-        try:
-            return maskpass.askpass(prompt=prompt, mask='*')
-        except KeyboardInterrupt:
-            print("\nOperation cancelled.")
-            raise
-        # Remove the generic Exception catch - let errors propagate
+    while True:
+        char = msvcrt.getwch()  # getwch() en lugar de getch() para Unicode
         
-except ImportError:
-    # Only fallback if maskpass is not installed at all
-    import getpass
+        if char in ('\r', '\n'):  # Enter
+            print()
+            break
+        elif char == '\b':  # Backspace
+            if len(password) > 0:
+                password = password[:-1]
+                # Borrar el asterisco en pantalla
+                sys.stdout.write('\b \b')
+                sys.stdout.flush()
+        elif char == '\x03':  # Ctrl+C
+            print()
+            raise KeyboardInterrupt
+        else:
+            password += char
+            sys.stdout.write('*')
+            sys.stdout.flush()
     
-    def input_password_masked(prompt='Password: '):
-        """Fallback to getpass without masking."""
-        return getpass.getpass(prompt)
+    return password
 
-# Force UTF-8 encoding on Windows (if not maskpass will give error with special chars)
+# Force UTF-8 encoding on Windows
 if sys.platform == 'win32':
     # Set console to UTF-8 mode
     os.system('chcp 65001 > nul')
@@ -193,17 +212,20 @@ def auto_expire_session(session, check_interval=30):
     
     def checker():
         while not stop_event.is_set():
-            time.sleep(check_interval)
+            for _ in range(check_interval):
+                if stop_event.is_set():
+                    return
+                time.sleep(1)
+
             if session.expired():
-                print("\n⏱ Session expired due to inactivity. Clearing key...")
+                print("\nSession expired due to inactivity. Clearing key...")
                 session.clear_key()
-                print("🔒 Session locked. Re-authentication required on next command.\n")
+                print("Session locked. Re-authentication required on next command.\n")
                 break
     
     thread = threading.Thread(target=checker, daemon=True, name="SessionExpiry")
     thread.start()
-    return stop_event
-
+    return stop_event, thread
 
 def prompt_master_password():
     """
@@ -226,7 +248,7 @@ def prompt_master_password():
             del password_confirm  # Clean up confirmation
             return password
         else:
-            print("[X] Passwords do not match. Please try again.\n")
+            print(f"{CROSS} Passwords do not match. Please try again.\n")
             del password  # Clean up original password
             del password_confirm  # Clean up confirmation
             # Loop continues, asking for password from the beginning
@@ -268,16 +290,16 @@ def prompt_and_verify_two_factor():
             try:
                 card = DNIeCard()
                 card.connect()
-                print("[✓] DNIe card detected")
+                print(f"{CHECK} DNIe card detected")
 
                 # Get serial hash BEFORE authenticating
                 dnie_hash = card.get_serial_hash()
-                print(f"[✓] DNIe identified: {dnie_hash[:8]}...")
+                print(f"{CHECK} DNIe identified: {dnie_hash[:8]}...")
                 break  # Card detected, exit retry loop
                 
             except DNIeCardError as e:
                 if "not detected" in str(e).lower() or "no smart card" in str(e).lower():
-                    print("[!] Card not detected.")
+                    print(f"{WARNING} Card not detected.")
                     retry = input("Press Enter to retry, or 'q' to quit: ").strip().lower()
                     if retry == 'q':
                         print("Authentication cancelled.")
@@ -285,16 +307,16 @@ def prompt_and_verify_two_factor():
                     continue  # Retry card detection
                 else:
                     # Other DNIe errors (not detection-related)
-                    print(f"[X] DNIe error: {e}")
+                    print(f"{CROSS} DNIe error: {e}")
                     break  # Exit retry loop, count as failed attempt
             except Exception as e:
-                print(f"[X] Error: {e}")
+                print(f"{CROSS} Error: {e}")
                 break  # Exit retry loop, count as failed attempt
         
         # If card connection failed for non-detection reasons, try next attempt
         if card is None or not hasattr(card, 'session') or card.session is None:
             if attempt < MAX_ATTEMPTS:
-                print(f"   {MAX_ATTEMPTS - attempt} attempts remaining.")
+                print(f" {MAX_ATTEMPTS - attempt} attempts remaining.")
                 continue
             else:
                 break
@@ -302,7 +324,7 @@ def prompt_and_verify_two_factor():
         # STEP 2: Verify that the DNIe is registered
         if not is_dnie_registered(dnie_hash):
             print("\n" + "="*80)
-            print("[X] DNIe NOT REGISTERED")
+            print(f"{CROSS} DNIe NOT REGISTERED")
             print("="*80)
             print(f"\nThis DNIe ({dnie_hash[:8]}...) is not registered in the system.")
             print("Would you like to initialize a new database for this DNIe?")
@@ -317,21 +339,21 @@ def prompt_and_verify_two_factor():
                 from sys import exit as sys_exit
                 result = init_database()
                 if result:
-                    print("\n[✓] Initialization complete! You can now use the password manager.")
+                    print("\n{CHECK} Initialization complete! You can now use the password manager.")
                     return result
                 else:
-                    print("\n[X] Initialization cancelled or failed.")
+                    print("\n{CROSS} Initialization cancelled or failed.")
                     return None
             else:
                 print("Exiting password manager.")
                 return None
         
-        print("[✓] DNIe registered in the system")
+        print(f"{CHECK} DNIe registered in the system")
 
         # Get user_id from registry
         user_id = get_user_id_from_dnie(dnie_hash)
         if not user_id:
-            print("[X] Error: Could not retrieve user_id from registry")
+            print(f"{CROSS} Error: Could not retrieve user_id from registry")
             card.disconnect()
             return None
     
@@ -345,7 +367,7 @@ def prompt_and_verify_two_factor():
 
         # Verify that files exist
         if not os.path.exists(salt_file) or not os.path.exists(wrapped_key_file):
-            print(f"\n[X] Error: Configuration files not found for this DNIe.")
+            print(f"\n{CROSS} Error: Configuration files not found for this DNIe.")
             print("Database may be corrupted.")
             card.disconnect()
             return None
@@ -362,9 +384,9 @@ def prompt_and_verify_two_factor():
             card.disconnect()
             
         except DNIeCardError as e:
-            print(f"[X] DNIe authentication error: {e}")
+            print(f"{CROSS} DNIe authentication error: {e}")
             if attempt < MAX_ATTEMPTS:
-                print(f"   {MAX_ATTEMPTS - attempt} attempts remaining.")
+                print(f" {MAX_ATTEMPTS - attempt} attempts remaining.")
                 try:
                     card.disconnect()
                 except:
@@ -377,9 +399,9 @@ def prompt_and_verify_two_factor():
                     pass
                 break
         except Exception as e:
-            print(f"[X] Error: {e}")
+            print(f"{CROSS} Error: {e}")
             if attempt < MAX_ATTEMPTS:
-                print(f"   {MAX_ATTEMPTS - attempt} attempts remaining.")
+                print(f" {MAX_ATTEMPTS - attempt} attempts remaining.")
                 try:
                     card.disconnect()
                 except:
@@ -412,7 +434,7 @@ def prompt_and_verify_two_factor():
             # NOTE: Do NOT delete dnie_wrapping_key and password_key here
             # They are needed for key rotation and must be returned to the session
             del wrapped_k_db
-            print("[✓] K_db unwrapped successfully")
+            print(f"{CHECK} K_db unwrapped successfully")
             
             # Try to decrypt database with K_db
             try:
@@ -433,7 +455,7 @@ def prompt_and_verify_two_factor():
                 del decrypted
                 del encrypted
                 
-                print("\n[✓] TWO-FACTOR AUTHENTICATION SUCCESSFUL!")
+                print("\nTWO-FACTOR AUTHENTICATION SUCCESSFUL!")
                 print("=" * 80)
 
                 # Return all keys needed for session (k_db + wrapping keys for rotation)
@@ -445,24 +467,24 @@ def prompt_and_verify_two_factor():
                 )
             
             except Exception as e:
-                print(f"[X] Authentication failed. Incorrect credentials or corrupted database.")
+                print(f"{CROSS} Authentication failed. Incorrect credentials or corrupted database.")
                 print(f"   Error: {e}")
                 if attempt < MAX_ATTEMPTS:
-                    print(f"   {MAX_ATTEMPTS - attempt} attempts remaining.")
+                    print(f" {MAX_ATTEMPTS - attempt} attempts remaining.")
 
                 del k_db # Clean up failed attempt     
                     
         except Exception as e:
-            print(f"[X] Unwrapping failed: {e}")
+            print(f"{CROSS} Unwrapping failed: {e}")
             if attempt < MAX_ATTEMPTS:
-                print(f"   {MAX_ATTEMPTS - attempt} attempts remaining.")
+                print(f" {MAX_ATTEMPTS - attempt} attempts remaining.")
             # Clean up if variables exist
             if 'dnie_wrapping_key' in locals():
                 del dnie_wrapping_key
             if 'password_key' in locals():
                 del password_key
     
-    print(f"\n[X] Authentication failed after {MAX_ATTEMPTS} attempts.")
+    print(f"\n{CROSS} Authentication failed after {MAX_ATTEMPTS} attempts.")
     print("Exiting for security.")
     return None
 
@@ -489,7 +511,7 @@ def auto_rotate_on_logout(session):
         wrapped_key_file = get_wrapped_key_filename(session.user_id)
         
         if not os.path.exists(db_file):
-            print("[X] Database file not found. Skipping rotation.")
+            print(f"{CROSS} Database file not found. Skipping rotation.")
             return False
         
         # Step 1: Generate new random K_db
@@ -538,7 +560,7 @@ def auto_rotate_on_logout(session):
         return True
         
     except Exception as e:
-        print(f"[X] Key rotation failed: {e}")
+        print(f"{CROSS} Key rotation failed: {e}")
         return False
 
 
@@ -561,21 +583,21 @@ def init_database():
         try:
             card = DNIeCard()
             card.connect()
-            print("[✓] DNIe detected")
+            print(f"{CHECK} DNIe detected")
             
             dnie_hash = card.get_serial_hash()
-            print(f"[✓] DNIe identified: {dnie_hash[:8]}...")
+            print(f"{CHECK} DNIe identified: {dnie_hash[:8]}...")
             break
             
         except DNIeCardError as e:
             if "not detected" or "no smart card" in str(e).lower():
-                retry = input("[!] DNIe not detected. [Enter] retry, [q] cancel: ").strip().lower()
+                retry = input(f"{WARNING} DNIe not detected. [Enter] retry, [q] cancel: ").strip().lower()
                 if retry == 'q':
                     print("Initialization cancelled.")
                     return None
                 continue
             else:
-                print(f"[X] DNIe error: {e}")
+                print(f"{CROSS} DNIe error: {e}")
                 return None
     
     # Determine user_id
@@ -584,7 +606,7 @@ def init_database():
         print(f"\n⚠ This DNIe is already registered as: {user_id}")
     else:
         user_id = get_next_user_id()
-        print(f"\n[✓] New user: {user_id}")
+        print(f"\n{CHECK} New user: {user_id}")
 
     # Get user-specific file names
     salt_file = get_salt_filename(user_id)
@@ -614,7 +636,7 @@ def init_database():
     is_new_registration = not is_dnie_registered(dnie_hash)
 
     if is_new_registration:
-        print(f"\n[✓] New DNIe registration")
+        print(f"\n{CHECK} New DNIe registration")
         
         while True:
             description = input("Enter a description for this DNIe (optional, e.g., 'Work Laptop', 'Personal'): ").strip()
@@ -627,16 +649,16 @@ def init_database():
             
             # Validate description length
             elif len(description) > 50:
-                print("[!] Description too long (max 50 characters). Please try again.")
+                print(f"{WARNING} Description too long (max 50 characters). Please try again.")
                 continue
             
             # Check for valid characters (optional)
             elif not all(c.isalnum() or c.isspace() or c in "-_.,'" for c in description):
-                print("[!] Description contains invalid characters. Use only letters, numbers, spaces, and -_.,")
+                print(f"{WARNING} Description contains invalid characters. Use only letters, numbers, spaces, and -_.,")
                 continue
             
             else:
-                print(f"[✓] Description set: {description}")
+                print(f"{CHECK} Description set: {description}")
                 break
     
     # STEP 4: Authenticate with PIN
@@ -644,11 +666,11 @@ def init_database():
         pin = input_password_masked("Enter DNIe PIN: ")
         dnie_wrapping_key = card.authenticate(pin)
         del pin  # Remove reference to PIN
-        print("[✓] Signature challenge successful")
+        print(f"{CHECK} Signature challenge successful")
         card.disconnect()
         
     except DNIeCardError as e:
-        print(f"[X] DNIe error: {e}")
+        print(f"{CROSS} DNIe error: {e}")
         print("Initialization failed.")
         try:
             card.disconnect()
@@ -656,7 +678,7 @@ def init_database():
             pass
         return None
     except Exception as e:
-        print(f"[X] Error: {e}")
+        print(f"{CROSS} Error: {e}")
         print("Initialization failed.")
         try:
             card.disconnect()
@@ -673,18 +695,16 @@ def init_database():
     try:
         password_key = derive_key_from_password(password, salt)
         del password  # Remove reference to password
-        print("[✓] Password key derived")
+        print(f"{CHECK} Password key derived")
         
         # Step 6: Generate random K_db
         print("STEP 3: Generating random database key...")
         k_db = Fernet.generate_key()  # Random 32-byte key
-        print(f"[✓] Generated K_db ({len(k_db)} bytes)")
+        print(f"{CHECK} Generated K_db ({len(k_db)} bytes)")
 
         # Step 7: Wrap K_db
         print("\nSTEP 4: Wrapping database key...")
         wrapped_k_db = wrap_database_key(k_db, dnie_wrapping_key, password_key)
-        del dnie_wrapping_key   # Remove reference to DNIe key
-        del password_key     # Remove reference to password key
         
         # Save user-specific files
         with open(salt_file, 'wb') as f:
@@ -700,15 +720,15 @@ def init_database():
         print("\nSTEP 5: Creating encrypted database...")
         empty_db = {}
         save_database(empty_db, k_db, db_file)
-        print("[✓] Database created and encrypted with K_db")
+        print(f"{CHECK} Database created and encrypted with K_db")
         
         # STEP 9: Register DNIe in registry (ADD THIS)
         if is_new_registration:
             register_dnie(dnie_hash, user_id, description)
-            print(f"[✓] DNIe registered in system")
+            print(f"{CHECK} DNIe registered in system")
 
             print("\n" + "=" * 80)
-            print("[✓] INITIALIZATION COMPLETE!")
+            print(f"{CHECK} INITIALIZATION COMPLETE!")
             print("=" * 80)
             print("\n🔐 Your database is protected by:")
             print("  • Random K_db (stored encrypted)")
@@ -716,10 +736,10 @@ def init_database():
             print("  • Master password (Argon2id-derived key)")
 
         # Return immediate session start
-        return (bytearray(k_db), user_id)
+        return (bytearray(k_db), user_id, dnie_wrapping_key, password_key)
     
     except Exception as e:
-        print(f"\n[X] Initialization failed: {e}")
+        print(f"\n{CROSS} Initialization failed: {e}")
 
         # Clean up sensitive variables if they exist
         if 'k_db' in locals() and k_db is not None:
@@ -819,12 +839,12 @@ def create_command_parser():
     # INIT command
     init_p = subparsers.add_parser('init',
         help='Re-initialize database',
-        description='⚠️  Destroy current database and create new one with new master password. ALL DATA WILL BE LOST!')
+        description='{WARNING}  Destroy current database and create new one with new master password. ALL DATA WILL BE LOST!')
     
     # DESTROY-DB command
     destroy_p = subparsers.add_parser('destroy-db',
         help='Destroy database permanently',
-        description='⚠️  Permanently delete database and all backups. This action is IRREVERSIBLE!')
+        description='{WARNING}  Permanently delete database and all backups. This action is IRREVERSIBLE!')
     
     # HELP command
     help_p = subparsers.add_parser('help',
@@ -842,7 +862,7 @@ def show_enhanced_help():
 ║           PASSWORD MANAGER - COMMAND REFERENCE                     ║
 ╚════════════════════════════════════════════════════════════════════╝
 
-📝 MANAGING ENTRIES
+ MANAGING ENTRIES
 
   add <service> <username>
       Add a new password entry with optional random password generation
@@ -878,7 +898,7 @@ def show_enhanced_help():
       List all stored services
       Example: list
 
-💾 DATABASE OPERATIONS
+ DATABASE OPERATIONS
 
   backup
       Create a backup of the encrypted database
@@ -893,13 +913,13 @@ def show_enhanced_help():
           
   init
       Re-initialize database with new master password
-      ⚠️  WARNING: This destroys all existing data!
+      WARNING: This destroys all existing data!
 
   destroy-db
       Permanently delete database and all backups
-      ⚠️  WARNING: This is irreversible!
+      WARNING: This is irreversible!
 
-❓ HELP & EXIT
+ HELP & EXIT
 
   help [command]
       Show this help or help for specific command
@@ -909,14 +929,14 @@ def show_enhanced_help():
   exit | quit
       Exit password manager (secure cleanup)
 
-🔐 PASSWORD REQUIREMENTS
+ PASSWORD REQUIREMENTS
 
   • Length: 16-60 characters
   • Must include: uppercase, lowercase, digit, special character
   • Special characters: !@#$%^&*()-_=+[]{}|;:,.<>?/
   • International characters supported (UTF-8)
 
-✨ PASSWORD GENERATOR FEATURES
+ PASSWORD GENERATOR FEATURES
 
   • Cryptographically secure random generation using secrets module
   • Customizable length (16-60 characters)
@@ -925,7 +945,7 @@ def show_enhanced_help():
   • Option to regenerate or enter manually
   • Available in both 'add' and 'edit' commands
 
-💡 TIP: Type 'help <command>' for detailed help on any command
+ TIP: Type 'help <command>' for detailed help on any command
       Example: help add
 """)
 
@@ -967,7 +987,7 @@ def run_session(timeout_minutes, initial_result=None):
                 session._key_locked = False
         
         # Start background thread to auto-expire session
-        expiry_stop = auto_expire_session(session, check_interval=30)
+        expiry_stop, expiry_thread = auto_expire_session(session, check_interval=30)
 
         # Create on-demand database wrapper
         db_file = get_db_filename(session.user_id)
@@ -1009,16 +1029,16 @@ def run_session(timeout_minutes, initial_result=None):
                     success = auto_rotate_on_logout(session)
                     
                     if success:
-                        print("[✓] Base de datos protegida con nueva clave aleatoria")
-                        print("[✓] Forward secrecy: clave anterior invalidada")
+                        print(f"{CHECK} Base de datos protegida con nueva clave aleatoria")
+                        print(f"{CHECK} Forward secrecy: clave anterior invalidada")
                     else:
-                        print("[!] Rotación de clave no completada (base de datos sigue accesible)")
+                        print(f"{WARNING} Rotación de clave no completada (base de datos sigue accesible)")
                     
                     break
                 
                 # Re-authenticate if session expired
                 if session.expired():
-                    print("\n⏱  Session expired. Re-authentication required.")
+                    print("\nSession expired. Re-authentication required.")
                     encrypted_db.clear()
                     
                     result = prompt_and_verify_two_factor()
@@ -1026,11 +1046,11 @@ def run_session(timeout_minutes, initial_result=None):
                     if result is None:
                         print("Re-authentication failed. Ending session.")
                         break
-                    k_db, user_id = result
+                    auth_k_db, auth_user_id, *_ = result
 
                     # Verify it's the same user
                     if user_id != session.user_id:
-                        print(f"[X] Error: Different DNIe detected (expected {session.user_id}, got {user_id})")
+                        print(f"{CROSS} Error: Different DNIe detected (expected {session.user_id}, got {user_id})")
                         print("Cannot continue session with different user. Ending session.")
                         del k_db
                         del user_id
@@ -1055,7 +1075,7 @@ def run_session(timeout_minutes, initial_result=None):
                     # Create new database wrapper with new key
                     db_file = get_db_filename(session.user_id)
                     encrypted_db = EncryptedDatabase(bytes(session.fernet_key), db_filename=db_file)
-                    print("[✓] Re-authenticated successfully.\n")
+                    print(f"{CHECK} Re-authenticated successfully.\n")
                 
                 # Handle help command with optional specific command
                 if line == "help" or line.startswith("help "):
@@ -1096,7 +1116,7 @@ def run_session(timeout_minutes, initial_result=None):
 
                         # Check if service already exists
                         if encrypted_db.service_exists(service):
-                            print(f"[X] Service '{service}' already exists.")
+                            print(f"{CROSS} Service '{service}' already exists.")
                             print(f"   Use 'edit {service}' to modify it, or 'delete {service}' to remove it.")
                             continue
                         
@@ -1154,10 +1174,10 @@ def run_session(timeout_minutes, initial_result=None):
                         
                         # Add entry (automatically encrypts)
                         if encrypted_db.add_entry(service, username, password):
-                            print(f"[✓] Entry added for service {service}.")
+                            print(f"{CHECK} Entry added for service {service}.")
                             session.last_auth = datetime.now()
                         else:
-                            print(f"[X] Failed to add entry for {service}.")
+                            print(f"{CROSS} Failed to add entry for {service}.")
                         
                         if password is not None:
                             del password
@@ -1244,10 +1264,10 @@ def run_session(timeout_minutes, initial_result=None):
                         
                         # Update entry
                         if encrypted_db.edit_entry(service, username=new_username, password=new_password):
-                            print(f"[✓] Entry edited for service {service}.")
+                            print(f"{CHECK} Entry edited for service {service}.")
                             session.last_auth = datetime.now()
                         else:
-                            print(f"[X] Failed to edit entry for {service}.")
+                            print(f"{CROSS} Failed to edit entry for {service}.")
                         
                         if new_password is not None:
                             del new_password
@@ -1297,7 +1317,7 @@ def run_session(timeout_minutes, initial_result=None):
                             # Copy to clipboard
                             pyperclip.copy(password)
                             print(f"Password for '{service}' copied to clipboard.")
-                            print("⚠️  Remember to clear clipboard after use (paste or copy something else)")
+                            print("{WARNING}  Remember to clear clipboard after use (paste or copy something else)")
                             del password
                             
                             session.last_auth = datetime.now()
@@ -1317,10 +1337,10 @@ def run_session(timeout_minutes, initial_result=None):
                             continue
                     
                     if encrypted_db.delete_entry(args.service):
-                        print(f"[✓] Entry deleted for service '{args.service}'.")
+                        print(f"{CHECK} Entry deleted for service '{args.service}'.")
                         session.last_auth = datetime.now()
                     else:
-                        print(f"[X] Failed to delete entry for '{args.service}'.")
+                        print(f"{CROSS} Failed to delete entry for '{args.service}'.")
                 
                 elif cmd == 'backup':
                     ok = backup_database(session.user_id)
@@ -1331,16 +1351,17 @@ def run_session(timeout_minutes, initial_result=None):
                     ok = restore_database(session.user_id)
                     if ok:
                         encrypted_db.reload_from_disk()
-                        print("[✓] Database restored from backup.")
+                        print(f"{CHECK} Database restored from backup.")
                     else:
-                        print("[X] Restore failed.")
+                        print(f"{CROSS} Restore failed.")
                     session.last_auth = datetime.now()
                 
                 elif cmd == 'lock':
-                    print("🔒 Session locked. All sensitive data cleared from memory.")
-                    
                     # Stop the background expiry thread
                     expiry_stop.set()
+                    expiry_thread.join(timeout=2)  # Wait max 2 seconds
+
+                    print("Session locked. All sensitive data cleared from memory.")
                     
                     # Clear sensitive data
                     encrypted_db.clear()
@@ -1354,11 +1375,11 @@ def run_session(timeout_minutes, initial_result=None):
                         print("Re-authentication failed. Ending session.")
                         break
                     
-                    k_db, user_id = result
+                    k_db, user_id, *_ = result
                     
                     # Verify same user
                     if user_id != session.user_id:
-                        print(f"[X] Error: Different DNIe detected")
+                        print(f"{CROSS} Error: Different DNIe detected")
                         del k_db
                         del user_id
                         break
@@ -1380,14 +1401,14 @@ def run_session(timeout_minutes, initial_result=None):
                     
                     session.last_auth = datetime.now()
                     
-                    # Restart expiry thread
-                    expiry_stop = auto_expire_session(session, check_interval=30)
-                    
                     # Recreate database wrapper
                     db_file = get_db_filename(session.user_id)
                     encrypted_db = EncryptedDatabase(bytes(session.fernet_key), db_filename=db_file)
+
+                    # Restart expiry thread
+                    expiry_stop, expiry_thread = auto_expire_session(session, check_interval=30)
                     
-                    print("[✓] Session unlocked successfully.\n")
+                    print(f"{CHECK} Session unlocked successfully.\n")
                     continue
                 
                 elif cmd == 'init':
@@ -1402,12 +1423,12 @@ def run_session(timeout_minutes, initial_result=None):
                         print("Re-authentication failed.")
                         break
                     
-                    auth_k_db, auth_user_id = result
+                    auth_k_db, auth_user_id, *_ = result
                     del auth_k_db
                     
                     # Verify it's the same user trying to reinit their own database
                     if auth_user_id != session.user_id:
-                        print(f"[X] Error: Cannot reinit database of different user")
+                        print(f"{CROSS} Error: Cannot reinit database of different user")
                         del auth_user_id
                         continue
                     
@@ -1437,7 +1458,7 @@ def run_session(timeout_minutes, initial_result=None):
                         if dnie_hash_to_remove in registry.get('dnies', {}):
                             del registry['dnies'][dnie_hash_to_remove]
                             save_dnie_registry(registry)
-                            print(f"[✓] DNIe unregistered from system")
+                            print(f"{CHECK} DNIe unregistered from system")
 
                     # Call init_database() which now handles two-factor setup
                     new_result = init_database()
@@ -1445,11 +1466,11 @@ def run_session(timeout_minutes, initial_result=None):
                         print("Initialization failed.")
                         break
                     
-                    new_k_db, new_user_id = new_result
+                    new_k_db, new_user_id, *_ = new_result
 
                     # Verify it's still the same user
                     if new_user_id != session.user_id:
-                        print(f"[X] Error: User mismatch after init")
+                        print(f"{CROSS} Error: User mismatch after init")
                         del new_k_db
                         del new_user_id
                         break
@@ -1473,7 +1494,7 @@ def run_session(timeout_minutes, initial_result=None):
 
                     # Create new database wrapper with new key
                     encrypted_db = EncryptedDatabase(bytes(session.fernet_key), db_filename=db_file)
-                    print("[✓] Database re-initialized successfully.")
+                    print(f"{CHECK} Database re-initialized successfully.")
                 
                 elif cmd == 'destroy-db':
                     confirm = input("Type 'DELETE' to confirm database destruction: ").strip()
@@ -1487,12 +1508,12 @@ def run_session(timeout_minutes, initial_result=None):
                         print("Re-authentication failed. Cannot destroy database.")
                         break
                     
-                    auth_k_db, auth_user_id = result
+                    auth_k_db, auth_user_id, *_ = result
                     del auth_k_db  # Don't need the key, just verify identity
 
                     # Verify it's the same user trying to destroy their own database
                     if auth_user_id != session.user_id:
-                        print(f"[X] Error: Cannot destroy database of different user")
+                        print(f"{CROSS} Error: Cannot destroy database of different user")
                         print(f"   Current session: {session.user_id}")
                         print(f"   Authenticated as: {auth_user_id}")
                         del auth_user_id
@@ -1518,18 +1539,18 @@ def run_session(timeout_minutes, initial_result=None):
                     removed = destroy_database_files(session.user_id)
                     
                     if removed:
-                        print("[✓] Database files securely deleted.")
+                        print(f"{CHECK} Database files securely deleted.")
                         # Unregister the DNIe from the registry
                         if dnie_hash_to_remove:
                             registry = load_dnie_registry()
                             if dnie_hash_to_remove in registry.get('dnies', {}):
                                 del registry['dnies'][dnie_hash_to_remove]
                                 save_dnie_registry(registry)
-                                print(f"[✓] DNIe unregistered from system")
+                                print(f"{CHECK} DNIe unregistered from system")
 
                         print("  Session will now end.")
                     else:
-                        print("[X] No database files found to remove.")
+                        print(f"{CROSS} No database files found to remove.")
                     
                     break  # End session after destruction
                 
@@ -1562,7 +1583,7 @@ def main():
         if result is None:
             return
 
-        print("\n[✓] Setup complete! Starting session...\n")
+        print("\n{CHECK} Setup complete! Starting session...\n")
         
         # Start session with keys from init (skip authentication)
         run_session(timeout_minutes=4, initial_result=result)

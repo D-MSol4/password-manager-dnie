@@ -4,11 +4,26 @@ Handles authentication and key derivation using Spanish DNIe smart card.
 """
 import platform
 import pkcs11
+import sys
+import os
 from pkcs11 import Mechanism, ObjectClass, Attribute
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
+# Símbolos adaptativos según el terminal
+if sys.platform == 'win32' and 'WT_SESSION' not in os.environ:
+    # cmd.exe tradicional - usar ASCII
+    CHECK = '[OK]'
+    CROSS = '{CROSS}'
+    WARNING = '{WARNING}'
+    INFO = '[i]'
+else:
+    # Windows Terminal, Linux, Mac - usar Unicode
+    CHECK = '✓'
+    CROSS = '✗'
+    WARNING = '⚠'
+    INFO = 'ℹ'
 
 class DNIeCardError(Exception):
     """Base exception for DNIe card operations"""
@@ -51,7 +66,7 @@ class DNIeCard:
             # Verify it's a DNIe (relaxed check)
             token_info = f"{self.token.label} {self.token.manufacturer_id}"
             if "DNI" not in token_info and "FNMT" not in token_info and "DGP" not in token_info:
-                print(f"[!] Warning: Card may not be a DNIe: {self.token.label}")
+                print(f"{WARNING} Warning: Card may not be a DNIe: {self.token.label}")
             
             # Open read-only session (no PIN yet)
             self.session = self.token.open(rw=False)
@@ -146,7 +161,7 @@ class DNIeCard:
                     
                     if keys:
                         private_key = keys[0]
-                        print(f"  [✓] Found private key" + (f": {label}" if label else ""))
+                        print(f"{CHECK} Found private key" + (f": {label}" if label else ""))
                         break
                 except:
                     continue
@@ -155,13 +170,13 @@ class DNIeCard:
                 raise DNIeCardError("No private key found on card for signature")
             
             # SIGN THE CHALLENGE (this proves possession of card + PIN)
-            print("  ⚙️  Signing challenge with DNIe private key...")
+            print("Signing challenge with DNIe private key...")
             signature = private_key.sign(
                 challenge,
                 mechanism=Mechanism.SHA256_RSA_PKCS
             )
             del private_key  # Remove private key reference from memory
-            print(f"  [✓] Signature generated ({len(signature)} bytes)")
+            print(f"{CHECK} Signature generated ({len(signature)} bytes)")
             
             # Derive wrapping key from signature using HKDF
             # The signature is deterministic (same challenge → same signature)
