@@ -1023,7 +1023,7 @@ def run_session(timeout_minutes, initial_result=None):
             style.configure('TFrame', background="#1e1e2f")
             style.configure('TLabel', background="#1e1e2f", foreground="#e0e0e0", font=('Segoe UI', 11))
             style.configure('TButton', font=('Segoe UI', 10), padding=5)
-            style.configure('Danger.TButton', foreground='#e0e0e0', font=('Segoe UI', 10, 'bold'))
+            style.configure('Danger.TButton', foreground='#2e2e3f', font=('Segoe UI', 10, 'bold'))
             style.configure('Treeview', background="#2e2e3f", fieldbackground="#2e2e3f", 
                             foreground="#e0e0e0", font=('Segoe UI', 10))
             style.configure('Treeview.Heading', font=('Segoe UI', 11, 'bold'))
