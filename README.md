@@ -232,22 +232,25 @@ pm> exit
 
 
 ## 📁 Estructura del Proyecto
-
+```
 dnie-password-manager/
-├── data/ # Directorio de datos (creado automáticamente)
-│ ├── dnie_registry.json # Registro de DNIes
-│ ├── passwords_user001.db # Base de datos cifrada
-│ ├── passwords_backup_user001.db # Backup de BD
-│ ├── db_salt_user001.bin # Salt para Argon2id
-│ └── wrapped_key_user001.bin # K_db envuelta
-├── main.py # CLI principal
-├── interfaz.py # GUI con PyQt6
-├── smartcard_dnie.py # Interfaz con DNIe (PKCS#11)
-├── crypto.py # Funciones criptográficas
-├── database.py # Gestión de BD cifrada
-├── requirements.txt # Dependencias Python
-├── README.md # Este archivo
-└── password_manager.log # Log de errores
+│
+├── data/                              # Directorio de datos (creado automáticamente)
+│   ├── dnie_registry.json            # Registro de DNIes
+│   ├── passwords_user001.db          # Base de datos cifrada
+│   ├── passwords_backup_user001.db   # Backup de BD
+│   ├── db_salt_user001.bin          # Salt para Argon2id
+│   └── wrapped_key_user001.bin       # K_db envuelta
+│
+├── main.py                            # CLI principal
+├── interfaz.py                        # GUI con PyQt6
+├── smartcard_dnie.py                 # Interfaz con DNIe (PKCS#11)
+├── crypto.py                          # Funciones criptográficas
+├── database.py                        # Gestión de BD cifrada
+├── requirements.txt                   # Dependencias Python
+├── README.md                          # Este archivo
+└── password_manager.log              # Log de errores
+```
 
 
 ## 🛠️ Tecnologías Utilizadas
