@@ -37,8 +37,8 @@ python-pkcs11>=0.7.0
 zeroize>=0.1.0
 numpy>=2.0.0
 
-# Password input with masking
-maskpass>=0.3.7
-
 # Clipboard support
 pyperclip>=1.11.0
+
+# GUI framework (PyQt6)
+PyQt6>=6.4.0
