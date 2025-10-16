@@ -683,11 +683,13 @@ def init_database():
             (lambda p1, p2: [
                 (lambda: [
                     log("[✓] Contraseñas coinciden", 'success'),
-                    (lambda salt, pk: [
-                        log("[✓] Clave de contraseña derivada", 'success'),
-                        step6_create_database(salt, getattr(step4_authenticate, 'dnie_wrapping_key'), 
-                                            pk, getattr(step4_authenticate, 'description'))
-                    ])(generate_salt(), derive_key_from_password(p1, generate_salt()))
+                    (lambda salt: [
+                    log("[✓] Clave de contraseña derivada", 'success'),
+                    step6_create_database(salt, getattr(step4_authenticate, 'dnie_wrapping_key'),
+                                        derive_key_from_password(p1, salt),
+                                        getattr(step4_authenticate, 'description'))
+                ])(generate_salt())
+
                 ] if is_valid_password(p1) else [
                     log("[✗] Contraseña debe tener al menos 12 caracteres", 'error'),
                     pass_entry.delete(0, tk.END),
