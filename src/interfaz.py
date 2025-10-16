@@ -1017,6 +1017,7 @@ def run_session(timeout_minutes, initial_result=None):
             root.geometry("950x650")
             root.configure(bg="#1e1e2f")
             
+            
             # Estilos
             style = ttk.Style(root)
             style.theme_use('clam')
