@@ -492,7 +492,7 @@ def init_database():
     pin_label = ttk.Label(input_frame, text="PIN del DNIe:")
     pin_entry = ttk.Entry(input_frame, show="*", width=40)
     
-    pass_label = ttk.Label(input_frame, text="Contraseña maestra (mín. 12 caracteres):")
+    pass_label = ttk.Label(input_frame, text="Contraseña maestra (mín. 16 caracteres):")
     pass_entry = ttk.Entry(input_frame, show="*", width=40)
     
     pass_confirm_label = ttk.Label(input_frame, text="Confirmar contraseña:")
@@ -1061,18 +1061,6 @@ def run_session(timeout_minutes, initial_result=None):
             # Separador
             ttk.Separator(root, orient='horizontal').pack(fill='x', padx=10, pady=5)
             
-            # Operaciones avanzadas (peligrosas)
-            advanced_frame = ttk.Frame(root)
-            advanced_frame.pack(fill='x', padx=10, pady=5)
-            
-            ttk.Label(advanced_frame, text="⚠️ Operaciones Avanzadas:", 
-                     font=('Segoe UI', 10, 'bold'), foreground='#ff9800').pack(side='left', padx=5)
-            
-            ttk.Button(advanced_frame, text="🔄 Reinicializar BD", style='Danger.TButton',
-                       command=lambda: reinit_database()).pack(side='left', padx=3)
-            ttk.Button(advanced_frame, text="💥 Eliminar BD", style='Danger.TButton',
-                       command=lambda: destroy_database()).pack(side='left', padx=3)
-            
             # Treeview
             tree_frame = ttk.Frame(root)
             tree_frame.pack(fill='both', expand=True, padx=10, pady=10)
@@ -1495,6 +1483,18 @@ def run_session(timeout_minutes, initial_result=None):
                     encrypted_db.clear()
                     root.destroy()
             
+            # Operaciones avanzadas (peligrosas)
+            advanced_frame = ttk.Frame(root)
+            advanced_frame.pack(fill='x', padx=10, pady=5)
+            
+            ttk.Label(advanced_frame, text="⚠️ Operaciones Avanzadas:", 
+                     font=('Segoe UI', 10, 'bold'), foreground='#ff9800').pack(side='left', padx=5)
+            
+            ttk.Button(advanced_frame, text="🔄 Reinicializar BD", style='Danger.TButton',
+                       command=lambda: reinit_database()).pack(side='left', padx=3)
+            ttk.Button(advanced_frame, text="💥 Eliminar BD", style='Danger.TButton',
+                       command=lambda: destroy_database()).pack(side='left', padx=3)
+
             # Vincular búsqueda
             search_var.trace_add('write', lambda *args: load_services())
             
