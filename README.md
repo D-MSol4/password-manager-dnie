@@ -71,18 +71,6 @@ DNIe Password Manager es un gestor de contraseñas de alta seguridad que impleme
 
 ## 🔒 Arquitectura de Seguridad
 
-### Flujo de Autenticación
-
-1. Usuario inserta DNIe → 2. Se detecta y lee hash del serial
-↓
-3. Usuario introduce PIN → 4. DNIe firma desafío criptográfico
-↓
-5. Usuario introduce contraseña maestra → 6. Se deriva clave con Argon2id
-↓
-7. Se combinan ambas claves (XOR + HKDF) → 8. Se desencripta K_db (clave de BD)
-↓
-9. Sesión autenticada ✅
-
 
 ### Capas de Cifrado
 
