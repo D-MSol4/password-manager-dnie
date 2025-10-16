@@ -1306,154 +1306,145 @@ def run_session(timeout_minutes, initial_result=None):
                         messagebox.showerror("Error", "No se pudo restaurar")
             
             def reinit_database():
-                """Reinicializar base de datos (borra contenido, mantiene estructura)"""
+                """Reinicializar base de datos - versión GUI standalone"""
                 nonlocal encrypted_db
                 
                 if not messagebox.askyesno("⚠️ ADVERTENCIA", 
-                                           "REINICIALIZAR BASE DE DATOS\n\n"
-                                           "Esto borrará TODAS las contraseñas\n"
-                                           "y creará nueva base con nueva contraseña maestra.\n\n"
-                                           "¿Continuar?",
-                                           icon='warning'):
+                                        "REINICIALIZAR BASE DE DATOS\n\n"
+                                        "• Borrará TODAS las contraseñas\n"
+                                        "• Creará nueva base con nueva contraseña maestra\n"
+                                        "• El DNIe se mantendrá registrado\n\n"
+                                        "¿Continuar?",
+                                        icon='warning'):
                     return
                 
-                confirm = simpledialog.askstring("Confirmación", 
+                confirm = simpledialog.askstring("Confirmación",
                                                 "Esta acción es IRREVERSIBLE.\n\n"
-                                                "Escriba 'INIT' para confirmar:", parent=root)
-                
+                                                "Escriba 'INIT' para confirmar:", 
+                                                parent=root)
                 if confirm != "INIT":
                     messagebox.showinfo("Cancelado", "Reinicialización cancelada")
                     return
                 
-                messagebox.showinfo("Re-autenticación", "Por seguridad, autentíquese de nuevo")
-                result = prompt_and_verify_two_factor()
+                # Crear ventana de re-autenticación
+                auth_window = tk.Toplevel(root)
+                auth_window.title("Re-autenticación")
+                auth_window.geometry("500x450")
+                auth_window.configure(bg='#1e1e2f')
+                auth_window.transient(root)
+                auth_window.grab_set()
                 
-                if result is None:
-                    messagebox.showerror("Error", "Re-autenticación fallida")
-                    return
+                auth_result = {'success': False, 'dnie_key': None, 'pass_key': None}
                 
-                auth_k_db, auth_user_id, *_ = result
-                del auth_k_db
+                frame = ttk.Frame(auth_window, padding=20)
+                frame.pack(fill='both', expand=True)
                 
-                if auth_user_id != session.user_id:
-                    messagebox.showerror("Error", f"No puede reinicializar BD de otro usuario")
-                    del auth_user_id
-                    return
+                ttk.Label(frame, text="RE-AUTENTICACIÓN REQUERIDA", 
+                        font=('Segoe UI', 14, 'bold')).pack(pady=(0, 20))
                 
-                registry = load_dnie_registry()
-                dnie_hash_to_remove = None
-                for dnie_hash, info in registry.get('dnies', {}).items():
-                    if info.get('user_id') == auth_user_id:
-                        dnie_hash_to_remove = dnie_hash
-                        break
+                log = ScrolledText(frame, height=8, bg='#2e2e3f', fg='white', 
+                                font=('Consolas', 10))
+                log.pack(fill='both', expand=True, pady=10)
                 
-                del auth_user_id
+                def log_msg(msg):
+                    log.insert(tk.END, msg + '\n')
+                    log.see(tk.END)
+                    auth_window.update()
                 
-                destroy_database_files(session.user_id)
+                # PIN
+                pin_frame = ttk.Frame(frame)
+                pin_frame.pack(fill='x', pady=5)
+                ttk.Label(pin_frame, text="PIN del DNIe:").pack(side='left', padx=5)
+                pin_entry = ttk.Entry(pin_frame, show='•', width=20)
+                pin_entry.pack(side='left', padx=5)
                 
-                if dnie_hash_to_remove:
-                    registry = load_dnie_registry()
-                    if dnie_hash_to_remove in registry.get('dnies', {}):
-                        del registry['dnies'][dnie_hash_to_remove]
-                        save_dnie_registry(registry)
+                # Password
+                pass_frame = ttk.Frame(frame)
+                pass_frame.pack(fill='x', pady=5)
+                ttk.Label(pass_frame, text="Contraseña maestra:").pack(side='left', padx=5)
+                pass_entry = ttk.Entry(pass_frame, show='•', width=20)
+                pass_entry.pack(side='left', padx=5)
                 
-                messagebox.showinfo("Inicialización", "Configurando nueva base de datos...")
-                new_result = init_database()
-                
-                if new_result is None:
-                    messagebox.showerror("Error", "Inicialización fallida")
-                    root.destroy()
-                    return
-                
-                new_k_db, new_user_id, new_dnie_key, new_pass_key = new_result
-                
-                if new_user_id != session.user_id:
-                    messagebox.showerror("Error", "Error de usuario tras inicialización")
-                    del new_k_db, new_user_id, new_dnie_key, new_pass_key
-                    root.destroy()
-                    return
-                
-                del new_user_id
-                
-                session.clear_key()
-                session.fernet_key = new_k_db
-                session.dnie_wrapping_key = new_dnie_key
-                session.password_key = new_pass_key
-                del new_k_db, new_dnie_key, new_pass_key
-                
-                if len(session.fernet_key) <= MAX_MLOCK_SIZE_LINUX:
+                def do_auth():
+                    pin = pin_entry.get().strip()
+                    password = pass_entry.get()
+                    
+                    if not pin or not password:
+                        log_msg("❌ Complete todos los campos")
+                        return
+                    
                     try:
-                        mlock(session.fernet_key)
-                        session._key_locked = True
-                    except:
-                        session._key_locked = False
+                        log_msg("Conectando con DNIe...")
+                        card = DNIeCard()
+                        card.connect()
+                        
+                        dnie_hash = card.get_serial_hash()
+                        log_msg(f"✓ DNIe detectado: {dnie_hash[:8]}...")
+                        
+                        if not is_dnie_registered(dnie_hash):
+                            log_msg("❌ DNIe no registrado")
+                            card.disconnect()
+                            return
+                        
+                        user_id = get_user_id_from_dnie(dnie_hash)
+                        
+                        if user_id != session.user_id:
+                            log_msg("❌ DNIe no coincide con sesión actual")
+                            card.disconnect()
+                            return
+                        
+                        log_msg("Autenticando PIN...")
+                        dnie_wrapping_key = card.authenticate(pin)
+                        card.disconnect()
+                        log_msg("✓ PIN correcto")
+                        
+                        # Verificar contraseña
+                        salt_file = get_salt_filename(user_id)
+                        with open(salt_file, 'rb') as f:
+                            salt = f.read()
+                        
+                        log_msg("Verificando contraseña maestra...")
+                        password_key = derive_key_from_password(password, salt)
+                        
+                        # Verificar contra wrapped key
+                        wrapped_key_file = get_wrapped_key_filename(user_id)
+                        with open(wrapped_key_file, 'rb') as f:
+                            wrapped = f.read()
+                        
+                        try:
+                            test_kdb = unwrap_database_key(wrapped, dnie_wrapping_key, password_key)
+                            del test_kdb
+                            log_msg("✓ Autenticación exitosa")
+                            
+                            auth_result['success'] = True
+                            auth_result['dnie_key'] = bytearray(dnie_wrapping_key)
+                            auth_result['pass_key'] = bytearray(password_key)
+                            
+                            auth_window.destroy()
+                        except:
+                            log_msg("❌ Contraseña incorrecta")
+                            pass_entry.delete(0, tk.END)
+                            
+                    except Exception as e:
+                        log_msg(f"❌ Error: {e}")
                 
-                session.last_auth = datetime.now()
-                encrypted_db = EncryptedDatabase(bytes(session.fernet_key), db_filename=db_file)
+                btn_frame = ttk.Frame(frame)
+                btn_frame.pack(pady=15)
+                ttk.Button(btn_frame, text="Autenticar", command=do_auth).pack(side='left', padx=5)
+                ttk.Button(btn_frame, text="Cancelar", 
+                        command=auth_window.destroy).pack(side='left', padx=5)
                 
-                messagebox.showinfo("Éxito", "✓ Base de datos reinicializada")
-                load_services()
-            
-            def destroy_database():
-                """Eliminar completamente la base de datos"""
-                if not messagebox.askyesno("⚠️ PELIGRO", 
-                                           "ELIMINAR BASE DE DATOS PERMANENTEMENTE\n\n"
-                                           "• Eliminará TODAS las contraseñas\n"
-                                           "• Eliminará archivos de configuración\n"
-                                           "• Desregistrará su DNIe\n"
-                                           "• ES IRREVERSIBLE\n\n"
-                                           "¿Está SEGURO?",
-                                           icon='warning'):
-                    return
+                pin_entry.focus()
+                pin_entry.bind('<Return>', lambda e: pass_entry.focus())
+                pass_entry.bind('<Return>', lambda e: do_auth())
                 
-                confirm = simpledialog.askstring("Confirmación CRÍTICA",
-                                                "⚠️ ÚLTIMA ADVERTENCIA ⚠️\n\n"
-                                                "Todo se perderá para siempre.\n\n"
-                                                "Escriba 'DELETE':", parent=root)
+                auth_window.wait_window()
                 
-                if confirm != "DELETE":
-                    messagebox.showinfo("Cancelado", "Eliminación cancelada")
-                    return
-                
-                messagebox.showinfo("Re-autenticación", "Autentíquese de nuevo")
-                result = prompt_and_verify_two_factor()
-                
-                if result is None:
+                if not auth_result['success']:
                     messagebox.showerror("Error", "Re-autenticación fallida")
                     return
                 
-                messagebox.showinfo("pasado1")
-                auth_k_db, auth_user_id, *_ = result
-                messagebox.showinfo("pasado2")
-                del auth_k_db
-                messagebox.showinfo("pasado3")
-
-                
-                if auth_user_id != session.user_id:
-                    messagebox.showerror("Error", f"No puede eliminar BD de otro usuario")
-                    del auth_user_id
-                    return
-                messagebox.showinfo("pasado4")
-                del auth_user_id
-                messagebox.showinfo("pasado5")
-                # Forzar actualización de la ventana después de la re-autenticación
-                root.update()
-                messagebox.showinfo("pasado6")
-                root.deiconify()  # Asegurar que root está visible
-                messagebox.showinfo("pasado7")
-                time.sleep(0.2)   # Pequeño delay para estabilizar el loop de eventos
-                messagebox.showinfo("pasado8")
-                
-                final_confirm = simpledialog.askstring("Confirmación FINAL",
-                                                       f"⚠️ PUNTO DE NO RETORNO ⚠️\n\n"
-                                                       f"Eliminará datos de: {session.user_id}\n\n"
-                                                       f"Escriba 'CONFIRM DELETE':", parent=root)
-                messagebox.showinfo("pasado9")
-                
-                if final_confirm != "CONFIRM DELETE":
-                    messagebox.showinfo("Cancelado", "Eliminación cancelada")
-                    return
-                
+                # Obtener dnie_hash para desregistrar
                 registry = load_dnie_registry()
                 dnie_hash_to_remove = None
                 for dnie_hash, info in registry.get('dnies', {}).items():
@@ -1461,26 +1452,341 @@ def run_session(timeout_minutes, initial_result=None):
                         dnie_hash_to_remove = dnie_hash
                         break
                 
+                # Destruir archivos
+                destroy_database_files(session.user_id)
+                
+                # Desregistrar DNIe temporalmente
+                if dnie_hash_to_remove:
+                    registry = load_dnie_registry()
+                    if dnie_hash_to_remove in registry.get('dnies', {}):
+                        del registry['dnies'][dnie_hash_to_remove]
+                        save_dnie_registry(registry)
+                
+                # Crear ventana de nueva configuración
+                setup_window = tk.Toplevel(root)
+                setup_window.title("Nueva Configuración")
+                setup_window.geometry("500x400")
+                setup_window.configure(bg='#1e1e2f')
+                setup_window.transient(root)
+                setup_window.grab_set()
+                
+                new_config = {'password': None, 'completed': False}
+                
+                frame2 = ttk.Frame(setup_window, padding=20)
+                frame2.pack(fill='both', expand=True)
+                
+                ttk.Label(frame2, text="NUEVA CONFIGURACIÓN", 
+                        font=('Segoe UI', 14, 'bold')).pack(pady=(0, 20))
+                
+                ttk.Label(frame2, text="Nueva contraseña maestra (min. 16 caracteres):").pack(pady=5)
+                new_pass_entry = ttk.Entry(frame2, show='•', width=40)
+                new_pass_entry.pack(pady=5)
+                
+                ttk.Label(frame2, text="Confirmar contraseña:").pack(pady=5)
+                confirm_pass_entry = ttk.Entry(frame2, show='•', width=40)
+                confirm_pass_entry.pack(pady=5)
+                
+                status_label = ttk.Label(frame2, text="", foreground='#ffaa00')
+                status_label.pack(pady=10)
+                
+                def create_new_db():
+                    pwd1 = new_pass_entry.get()
+                    pwd2 = confirm_pass_entry.get()
+                    
+                    if not pwd1 or not pwd2:
+                        status_label.config(text="❌ Complete todos los campos")
+                        return
+                    
+                    if pwd1 != pwd2:
+                        status_label.config(text="❌ Las contraseñas no coinciden")
+                        new_pass_entry.delete(0, tk.END)
+                        confirm_pass_entry.delete(0, tk.END)
+                        return
+                    
+                    if not is_valid_password(pwd1):
+                        status_label.config(text="❌ Contraseña debe tener al menos 16 caracteres")
+                        return
+                    
+                    status_label.config(text="✓ Creando nueva base de datos...")
+                    setup_window.update()
+                    
+                    try:
+                        # Generar nuevo salt
+                        new_salt = generate_salt()
+                        
+                        # Derivar nueva clave de password
+                        new_password_key = derive_key_from_password(pwd1, new_salt)
+                        del pwd1, pwd2
+                        
+                        # Generar nueva Kdb
+                        new_kdb = Fernet.generate_key()
+                        
+                        # Envolver nueva Kdb
+                        new_wrapped_kdb = wrap_database_key(new_kdb, 
+                                                            bytes(auth_result['dnie_key']), 
+                                                            new_password_key)
+                        
+                        # Guardar archivos
+                        salt_file = get_salt_filename(session.user_id)
+                        wrapped_key_file = get_wrapped_key_filename(session.user_id)
+                        db_file_path = get_db_filename(session.user_id)
+                        
+                        with open(salt_file, 'wb') as f:
+                            f.write(new_salt)
+                        secure_file_permissions(salt_file)
+                        
+                        with open(wrapped_key_file, 'wb') as f:
+                            f.write(new_wrapped_kdb)
+                        del new_wrapped_kdb
+                        secure_file_permissions(wrapped_key_file)
+                        
+                        # Crear base de datos vacía
+                        empty_db = {}
+                        save_database(empty_db, new_kdb, db_file_path)
+                        
+                        # Re-registrar DNIe
+                        if dnie_hash_to_remove:
+                            register_dnie(dnie_hash_to_remove, session.user_id, 
+                                        f"User {session.user_id}")
+                        
+                        new_config['password'] = new_password_key
+                        new_config['kdb'] = bytearray(new_kdb)
+                        new_config['completed'] = True
+                        
+                        status_label.config(text="✓ Base de datos creada", foreground='#00ff00')
+                        setup_window.after(1000, setup_window.destroy)
+                        
+                    except Exception as e:
+                        status_label.config(text=f"❌ Error: {e}")
+                
+                btn_frame2 = ttk.Frame(frame2)
+                btn_frame2.pack(pady=15)
+                ttk.Button(btn_frame2, text="Crear", command=create_new_db).pack(side='left', padx=5)
+                ttk.Button(btn_frame2, text="Cancelar", 
+                        command=setup_window.destroy).pack(side='left', padx=5)
+                
+                new_pass_entry.focus()
+                new_pass_entry.bind('<Return>', lambda e: confirm_pass_entry.focus())
+                confirm_pass_entry.bind('<Return>', lambda e: create_new_db())
+                
+                setup_window.wait_window()
+                
+                if not new_config['completed']:
+                    messagebox.showerror("Error", "Configuración cancelada")
+                    return
+                
+                # IMPORTANTE: Limpiar el objeto encrypted_db antiguo primero
+                encrypted_db.clear()
+                del encrypted_db
+
+                # Actualizar sesión
+                session.clear_key()
+                session.fernet_key = new_config['kdb']
+                session.dnie_wrapping_key = auth_result['dnie_key']
+                session.password_key = new_config['password']
+                
+                # Re-lockear en memoria
+                if len(session.fernet_key) <= MAX_MLOCK_SIZE_LINUX:
+                    try:
+                        mlock(session.fernet_key)
+                        session.key_locked = True
+                    except:
+                        session.key_locked = False
+                
+                session.last_auth = datetime.now()
+                
+                # Recrear objeto de base de datos
+                encrypted_db = EncryptedDatabase(bytes(session.fernet_key), db_filename=db_file)
+                # CRÍTICO: Forzar recarga desde disco para asegurar que lee la BD nueva
+                encrypted_db.reload_from_disk()
+                
+                messagebox.showinfo("Éxito", "✓ Base de datos reinicializada correctamente")
+
+                # Limpiar completamente el tree antes de recargar
+                for item in tree.get_children():
+                    tree.delete(item)
+                
+                # Ahora sí, cargar servicios (debería estar vacío)
+                load_services()
+
+
+
+            def destroy_database():
+                """Eliminar completamente la base de datos - versión GUI standalone"""
+                
+                if not messagebox.askyesno("⚠️ PELIGRO",
+                                        "ELIMINAR BASE DE DATOS PERMANENTEMENTE\n\n"
+                                        "• Eliminará TODAS las contraseñas\n"
+                                        "• Eliminará archivos de configuración\n"
+                                        "• Desregistrará su DNIe\n"
+                                        "• ES IRREVERSIBLE\n\n"
+                                        "¿Está SEGURO?",
+                                        icon='warning'):
+                    return
+                
+                confirm = simpledialog.askstring("Confirmación CRÍTICA",
+                                                "⚠️ ÚLTIMA ADVERTENCIA ⚠️\n\n"
+                                                "Todo se perderá para siempre.\n\n"
+                                                "Escriba 'DELETE':", 
+                                                parent=root)
+                if confirm != "DELETE":
+                    messagebox.showinfo("Cancelado", "Eliminación cancelada")
+                    return
+                
+                # Crear ventana de re-autenticación
+                auth_window = tk.Toplevel(root)
+                auth_window.title("Re-autenticación")
+                auth_window.geometry("500x450")
+                auth_window.configure(bg='#1e1e2f')
+                auth_window.transient(root)
+                auth_window.grab_set()
+                
+                auth_success = {'value': False}
+                
+                frame = ttk.Frame(auth_window, padding=20)
+                frame.pack(fill='both', expand=True)
+                
+                ttk.Label(frame, text="RE-AUTENTICACIÓN REQUERIDA", 
+                        font=('Segoe UI', 14, 'bold')).pack(pady=(0, 20))
+                
+                log = ScrolledText(frame, height=8, bg='#2e2e3f', fg='white', 
+                                font=('Consolas', 10))
+                log.pack(fill='both', expand=True, pady=10)
+                
+                def log_msg(msg):
+                    log.insert(tk.END, msg + '\n')
+                    log.see(tk.END)
+                    auth_window.update()
+                
+                # PIN
+                pin_frame = ttk.Frame(frame)
+                pin_frame.pack(fill='x', pady=5)
+                ttk.Label(pin_frame, text="PIN del DNIe:").pack(side='left', padx=5)
+                pin_entry = ttk.Entry(pin_frame, show='•', width=20)
+                pin_entry.pack(side='left', padx=5)
+                
+                # Password
+                pass_frame = ttk.Frame(frame)
+                pass_frame.pack(fill='x', pady=5)
+                ttk.Label(pass_frame, text="Contraseña maestra:").pack(side='left', padx=5)
+                pass_entry = ttk.Entry(pass_frame, show='•', width=20)
+                pass_entry.pack(side='left', padx=5)
+                
+                def do_auth():
+                    pin = pin_entry.get().strip()
+                    password = pass_entry.get()
+                    
+                    if not pin or not password:
+                        log_msg("❌ Complete todos los campos")
+                        return
+                    
+                    try:
+                        log_msg("Conectando con DNIe...")
+                        card = DNIeCard()
+                        card.connect()
+                        
+                        dnie_hash = card.get_serial_hash()
+                        log_msg(f"✓ DNIe detectado: {dnie_hash[:8]}...")
+                        
+                        user_id = get_user_id_from_dnie(dnie_hash)
+                        
+                        if user_id != session.user_id:
+                            log_msg("❌ DNIe no coincide con sesión actual")
+                            card.disconnect()
+                            return
+                        
+                        log_msg("Autenticando PIN...")
+                        dnie_wrapping_key = card.authenticate(pin)
+                        card.disconnect()
+                        log_msg("✓ PIN correcto")
+                        
+                        # Verificar contraseña
+                        salt_file = get_salt_filename(user_id)
+                        with open(salt_file, 'rb') as f:
+                            salt = f.read()
+                        
+                        log_msg("Verificando contraseña maestra...")
+                        password_key = derive_key_from_password(password, salt)
+                        
+                        wrapped_key_file = get_wrapped_key_filename(user_id)
+                        with open(wrapped_key_file, 'rb') as f:
+                            wrapped = f.read()
+                        
+                        try:
+                            test_kdb = unwrap_database_key(wrapped, dnie_wrapping_key, password_key)
+                            del test_kdb, dnie_wrapping_key, password_key
+                            log_msg("✓ Autenticación exitosa")
+                            
+                            auth_success['value'] = True
+                            auth_window.destroy()
+                        except:
+                            log_msg("❌ Contraseña incorrecta")
+                            pass_entry.delete(0, tk.END)
+                            
+                    except Exception as e:
+                        log_msg(f"❌ Error: {e}")
+                
+                btn_frame = ttk.Frame(frame)
+                btn_frame.pack(pady=15)
+                ttk.Button(btn_frame, text="Autenticar", command=do_auth).pack(side='left', padx=5)
+                ttk.Button(btn_frame, text="Cancelar", 
+                        command=auth_window.destroy).pack(side='left', padx=5)
+                
+                pin_entry.focus()
+                pin_entry.bind('<Return>', lambda e: pass_entry.focus())
+                pass_entry.bind('<Return>', lambda e: do_auth())
+                
+                auth_window.wait_window()
+                
+                if not auth_success['value']:
+                    messagebox.showerror("Error", "Re-autenticación fallida")
+                    return
+                
+                # Confirmación final
+                final_confirm = simpledialog.askstring("Confirmación FINAL",
+                                                    f"⚠️ PUNTO DE NO RETORNO ⚠️\n\n"
+                                                    f"Eliminará datos de: {session.user_id}\n\n"
+                                                    f"Escriba 'CONFIRM DELETE':", 
+                                                    parent=root)
+                
+                if final_confirm != "CONFIRM DELETE":
+                    messagebox.showinfo("Cancelado", "Eliminación cancelada")
+                    return
+                
+                # Obtener dnie_hash
+                registry = load_dnie_registry()
+                dnie_hash_to_remove = None
+                for dnie_hash, info in registry.get('dnies', {}).items():
+                    if info.get('user_id') == session.user_id:
+                        dnie_hash_to_remove = dnie_hash
+                        break
+                
+                # Destruir archivos
                 removed = destroy_database_files(session.user_id)
                 
                 if removed:
+                    # Desregistrar DNIe
                     if dnie_hash_to_remove:
                         registry = load_dnie_registry()
                         if dnie_hash_to_remove in registry.get('dnies', {}):
                             del registry['dnies'][dnie_hash_to_remove]
                             save_dnie_registry(registry)
                     
-                    messagebox.showinfo("Completado", 
-                                      "✓ Base de datos eliminada\n"
-                                      "✓ DNIe desregistrado\n\n"
-                                      "La sesión se cerrará.")
+                    messagebox.showinfo("Completado",
+                                        "✓ Base de datos eliminada\n"
+                                        "✓ DNIe desregistrado\n\n"
+                                        "La sesión se cerrará.")
                     
+                    # Limpieza y cierre
                     expiry_stop.set()
                     expiry_thread.join(timeout=2)
                     encrypted_db.clear()
                     root.destroy()
                 else:
                     messagebox.showerror("Error", "No se encontraron archivos")
+
+
+
             
             def close_session():
                 """Cerrar sesión de forma segura"""
