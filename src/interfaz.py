@@ -671,7 +671,7 @@ def init_database():
         log("\n" + "=" * 70)
         log("Paso 3: Configuración de contraseña maestra")
         log("=" * 70)
-        log("La contraseña debe tener al menos 12 caracteres")
+        log("La contraseña debe tener al menos 16 caracteres")
         
         hide_all_inputs()
         pass_label.pack(pady=5)
@@ -691,7 +691,7 @@ def init_database():
                 ])(generate_salt())
 
                 ] if is_valid_password(p1) else [
-                    log("[✗] Contraseña debe tener al menos 12 caracteres", 'error'),
+                    log("[✗] Contraseña debe tener al menos 16 caracteres", 'error'),
                     pass_entry.delete(0, tk.END),
                     pass_confirm_entry.delete(0, tk.END),
                     pass_entry.focus()
@@ -1023,7 +1023,7 @@ def run_session(timeout_minutes, initial_result=None):
             style.configure('TFrame', background="#1e1e2f")
             style.configure('TLabel', background="#1e1e2f", foreground="#e0e0e0", font=('Segoe UI', 11))
             style.configure('TButton', font=('Segoe UI', 10), padding=5)
-            style.configure('Danger.TButton', foreground='#ff6b6b', font=('Segoe UI', 10, 'bold'))
+            style.configure('Danger.TButton', foreground='#e0e0e0', font=('Segoe UI', 10, 'bold'))
             style.configure('Treeview', background="#2e2e3f", fieldbackground="#2e2e3f", 
                             foreground="#e0e0e0", font=('Segoe UI', 10))
             style.configure('Treeview.Heading', font=('Segoe UI', 11, 'bold'))
@@ -1421,20 +1421,33 @@ def run_session(timeout_minutes, initial_result=None):
                     messagebox.showerror("Error", "Re-autenticación fallida")
                     return
                 
+                messagebox.showinfo("pasado1")
                 auth_k_db, auth_user_id, *_ = result
+                messagebox.showinfo("pasado2")
                 del auth_k_db
+                messagebox.showinfo("pasado3")
+
                 
                 if auth_user_id != session.user_id:
                     messagebox.showerror("Error", f"No puede eliminar BD de otro usuario")
                     del auth_user_id
                     return
-                
+                messagebox.showinfo("pasado4")
                 del auth_user_id
+                messagebox.showinfo("pasado5")
+                # Forzar actualización de la ventana después de la re-autenticación
+                root.update()
+                messagebox.showinfo("pasado6")
+                root.deiconify()  # Asegurar que root está visible
+                messagebox.showinfo("pasado7")
+                time.sleep(0.2)   # Pequeño delay para estabilizar el loop de eventos
+                messagebox.showinfo("pasado8")
                 
                 final_confirm = simpledialog.askstring("Confirmación FINAL",
                                                        f"⚠️ PUNTO DE NO RETORNO ⚠️\n\n"
                                                        f"Eliminará datos de: {session.user_id}\n\n"
                                                        f"Escriba 'CONFIRM DELETE':", parent=root)
+                messagebox.showinfo("pasado9")
                 
                 if final_confirm != "CONFIRM DELETE":
                     messagebox.showinfo("Cancelado", "Eliminación cancelada")
