@@ -74,7 +74,7 @@ DNIe Password Manager es un gestor de contraseñas de alta seguridad que impleme
 
 ### Capas de Cifrado
 
-![Diagrama de cifrado](images/diagrama.jng)
+![Diagrama de cifrado](images/diagrama.jpg)
 
 
 ### Protección en Memoria
