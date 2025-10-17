@@ -316,12 +316,13 @@ dnie-password-manager/
 
 ## 🗺️ Roadmap
 
-### Versión Actual (v1.0)
+### Versión Actual (v2.0)
 
 - ✅ Autenticación 2FA con DNIe
 - ✅ Interfaz GUI y CLI
 - ✅ Cifrado robusto y protección en memoria
 - ✅ Multi-usuario
+- ✅ Rotación de claves
 
 ### Próximas Funcionalidades (v1.1)
 
