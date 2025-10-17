@@ -71,7 +71,7 @@ if sys.platform == 'win32':
     # Set console to UTF-8 mode
     os.system('chcp 65001 > nul')
     # Also set Python's default encoding
-    if sys.stdout.encoding != 'utf-8':
+    if sys.stdout and sys.stdout.encoding != 'utf-8':
         import io
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
         sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')

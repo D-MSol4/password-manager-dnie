@@ -29,6 +29,16 @@ from smartcard_dnie import DNIeCard, DNIeCardError
 from crypto import derive_key_from_password, unwrap_database_key
 from database import get_wrapped_key_filename, get_salt_filename, secure_file_permissions, save_database, DNIE_REGISTRY_FILE
 
+# Configuración de codificación para Windows
+if sys.platform == 'win32':
+    # Protección para cuando no hay stdout (PyInstaller con console=False)
+    if sys.stdout and hasattr(sys.stdout, 'encoding') and sys.stdout.encoding != 'utf-8':
+        import codecs
+        sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'strict')
+    if sys.stderr and hasattr(sys.stderr, 'encoding') and sys.stderr.encoding != 'utf-8':
+        import codecs
+        sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer, 'strict')
+
 class AuthenticationDialog(QDialog):
     """Diálogo personalizado para autenticación de dos factores"""
     
