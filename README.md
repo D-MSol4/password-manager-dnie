@@ -69,7 +69,7 @@ DNIe Password Manager es un gestor de contraseñas de alta seguridad que impleme
 - 📝 **Gestión completa de contraseñas**
   - Añadir, editar, eliminar y listar entradas
   - Generador de contraseñas seguras (16-60 caracteres)
-  - Copiar al portapapeles (auto-limpieza en 30s)
+  - Copiar al portapapeles
 - 🖥️ **Doble interfaz**
   - GUI moderna con PyQt6
   - CLI para uso avanzado y scripts
