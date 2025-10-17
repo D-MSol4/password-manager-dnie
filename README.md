@@ -1,6 +1,20 @@
 # 🔐 DNIe Password Manager
 
+[![GitHub Release](https://img.shields.io/github/v/release/D-MSol4/dnie-password-manager)](https://github.com/D-MSol4/dnie-password-manager/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/D-MSol4/dnie-password-manager/total)](https://github.com/D-MSol4/dnie-password-manager/releases)
+
 Gestor de contraseñas seguro con autenticación de dos factores mediante DNIe español (Documento Nacional de Identidad electrónico) y contraseña maestra.
+
+## 🚀 Descarga Rápida
+
+**¿Solo quieres usar la aplicación sin instalar Python?** Descarga los ejecutables precompilados:
+
+📥 **[Descargar Última Versión](https://github.com/D-MSol4/dnie-password-manager/releases/latest)**
+
+- **Interfaz Gráfica (Recomendado)**: `password_manager_gui.exe` - Aplicación con ventanas e interfaz visual
+- **Línea de Comandos**: `password_manager_cli.exe` - Versión CLI para usuarios avanzados
+
+> ⚠️ **Requisito**: Debes tener [OpenSC instalado](https://github.com/OpenSC/OpenSC/releases) para que los ejecutables funcionen.
 
 ## 📋 Tabla de Contenidos
 
