@@ -38,6 +38,7 @@ DNIe Password Manager es un gestor de contraseñas de alta seguridad que impleme
   - Base de datos cifrada con Fernet (AES-128-CBC + HMAC-SHA256)
   - Derivación de claves con Argon2id (memory-hard KDF)
   - HKDF para combinación segura de claves
+  - Rotación automática de claves de base de datos al cerrar sesión
 - ✅ **Protección en memoria**
   - Desencriptación on-demand (base de datos solo se desencripta temporalmente)
   - Memory locking con `mlock()` para prevenir swap
@@ -87,6 +88,25 @@ Solo la clave `K_db` permanece en memoria durante la sesión activa, protegida c
 - `bytearray` mutable para sobreescritura
 - `mlock()` para evitar swap a disco
 - `zeroize()` para limpieza criptográfica al cerrar
+
+### Rotación Automática de Claves
+
+El sistema implementa **rotación automática de la clave de base de datos** (`K_db`) cada vez que se cierra sesión, siguiendo el principio de *forward secrecy*:
+
+**Proceso de rotación:**
+
+1. **Al cerrar sesión** → Se genera una nueva `K_db` aleatoria
+2. **Re-encriptación** → Toda la base de datos se desencripta con la clave antigua y se re-encripta con la nueva
+3. **Wrapping seguro** → La nueva `K_db` se envuelve con `K_wrap` (DNIe + contraseña)
+4. **Limpieza** → La clave antigua se elimina de memoria con `zeroize()`
+
+**Beneficios de seguridad:**
+
+- 🔒 **Forward secrecy**: Si una clave antigua se compromete, no afecta a sesiones futuras
+- 🔄 **Renovación periódica**: Las claves se renuevan con cada sesión
+- 🛡️ **Protección adicional**: Mitiga ataques de recuperación de claves antiguas del disco
+
+**Nota**: Este proceso es completamente transparente para el usuario y no requiere intervención manual.
 
 ## 🖥️ Requisitos del Sistema
 
