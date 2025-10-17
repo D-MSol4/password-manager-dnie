@@ -11,9 +11,9 @@ from datetime import datetime, timedelta
 from cryptography.fernet import Fernet
 from crypto import derive_key_from_password, unwrap_database_key, wrap_database_key
 from database import (
-    EncryptedDatabase, DNIE_REGISTRY_FILE, is_valid_password, is_valid_entry, save_database, backup_database, restore_database, 
+    EncryptedDatabase, DNIE_REGISTRY_FILE, is_valid_password, is_valid_entry, save_database, 
     destroy_database_files, generate_random_password, secure_file_permissions, secure_all_sensitive_files,
-    get_db_filename, get_salt_filename, get_wrapped_key_filename, get_backup_filename, load_dnie_registry
+    get_db_filename, get_salt_filename, get_wrapped_key_filename, load_dnie_registry, secure_delete
 )
 from smartcard_dnie import DNIeCard, DNIeCardError
 
@@ -141,14 +141,49 @@ class Session:
     
     def __init__(self, fernet_key, user_id, dnie_wrapping_key, password_key, timeout_minutes=DEFAULT_SESSION_MINUTES):
         self.timeout = timedelta(minutes=timeout_minutes)
-        self.fernet_key = bytearray(fernet_key)
         self.user_id = user_id
         self.last_auth = datetime.now()
         self.key_locked = False
         
-        # Store wrapping keys for auto-rotation on logout
-        self.dnie_wrapping_key = bytearray(dnie_wrapping_key)
-        self.password_key = bytearray(password_key)
+        # K_db_actual: para usar durante la sesión
+        self.fernet_key = bytearray(fernet_key)
+        
+        # K_db_nueva: pre-generar para rotación al logout
+        self.fernet_key_next = bytearray(Fernet.generate_key())
+
+        try:
+            mlock(self.fernet_key)
+            mlock(self.fernet_key_next)
+        except Exception as e:
+            print(f"{WARNING} No se pudo bloquear memoria: {e}")
+
+        # Wrappear K_db_nueva y guardarla en disco como wrapped_key_new
+        self._save_next_wrapped_key(dnie_wrapping_key, password_key)
+        
+        # Limpiar claves de wrapping inmediatamente después de usarlas
+        zeroize1(dnie_wrapping_key)
+        zeroize1(password_key)
+        del dnie_wrapping_key, password_key
+
+        print(f"{CHECK} Sesión iniciada con rotación pre-generada")
+
+    def _save_next_wrapped_key(self, dnie_wrapping_key, password_key):
+        """Wrappea K_db_nueva y la guarda en disco con sufijo .new"""
+        from crypto import wrap_database_key
+        
+        # Wrappear K_db_nueva
+        wrapped_new = wrap_database_key(bytes(self.fernet_key_next), dnie_wrapping_key, password_key)
+        
+        # Guardar con nombre temporal
+        wrapped_key_file = get_wrapped_key_filename(self.user_id)
+        temp_wrapped_file = wrapped_key_file + ".new"
+        
+        with open(temp_wrapped_file, 'wb') as f:
+            f.write(wrapped_new)
+        secure_file_permissions(temp_wrapped_file)
+        
+        # Limpiar claves intermedias
+        del wrapped_new
         
     def expired(self):
         """Check if the session has expired."""
@@ -171,24 +206,19 @@ class Session:
             finally:
                 self.fernet_key = None
         
-        # Clear wrapping keys
-        if self.dnie_wrapping_key is not None:
+        # Clear next key
+        if self.fernet_key_next is not None:
             try:
-                if isinstance(self.dnie_wrapping_key, bytearray):
-                    zeroize1(self.dnie_wrapping_key)
+                if isinstance(self.fernet_key_next, bytearray):
+                    try:
+                        munlock(self.fernet_key_next)
+                    except:
+                        pass
+                    zeroize1(self.fernet_key_next)
             except Exception as e:
-                print(f"Warning: Failed to clear DNIe wrapping key: {e}")
+                print(f"Warning: Failed to clear next fernet key: {e}")
             finally:
-                self.dnie_wrapping_key = None
-                
-        if self.password_key is not None:
-            try:
-                if isinstance(self.password_key, bytearray):
-                    zeroize1(self.password_key)
-            except Exception as e:
-                print(f"Warning: Failed to clear password key: {e}")
-            finally:
-                self.password_key = None
+                self.fernet_key_next = None
     
     def __del__(self):
         """Ensure keys are cleared when session is destroyed."""
@@ -226,6 +256,69 @@ def auto_expire_session(session, check_interval=30):
     thread = threading.Thread(target=checker, daemon=True, name="SessionExpiry")
     thread.start()
     return stop_event, thread
+
+def auto_rotate_on_logout(session):
+    """
+    Rota la clave de la base de datos al cerrar la sesión para forward secrecy.
+    Re-encripta la base de datos con una nueva clave pre-generada y actualiza
+    el archivo de la clave wrappeada.
+    """
+    try:
+        # 1. Validar que la sesión y las claves necesarias existen
+        if not session or session.fernet_key is None or session.fernet_key_next is None:
+            print("❌ WARNING: No hay sesión o claves disponibles para la rotación.")
+            return False
+
+        # 2. Definir las rutas de los archivos
+        user_id = session.user_id
+        db_filename = get_db_filename(user_id)
+        wrapped_key_filename = get_wrapped_key_filename(user_id)
+        temp_wrapped_key_filename = wrapped_key_filename + ".new"
+
+        # 3. Verificar que el archivo de la nueva clave wrappeada existe
+        if not os.path.exists(temp_wrapped_key_filename):
+            print(f"❌ CROSS: No se encontró el archivo de la nueva clave wrappeada en {temp_wrapped_key_filename}. Se aborta la rotación.")
+            return False
+
+        print("INFO: Iniciando la rotación de claves...")
+
+        # 4. Desencriptar la base de datos con la clave actual
+        print("INFO: Desencriptando la base de datos con la clave actual...")
+        current_db = EncryptedDatabase(bytes(session.fernet_key), db_filename)
+        db_content_dict = current_db._decrypt_db()
+        # Es importante limpiar la referencia a la instancia de la DB antigua
+        del current_db 
+        
+        if db_content_dict is None:
+             print("❌ ERROR: No se pudo desencriptar la base de datos actual. Abortando rotación.")
+             return False
+
+        # 5. Re-encriptar el contenido con la nueva clave y guardarlo
+        print("INFO: Re-encriptando la base de datos con la nueva clave...")
+        new_db = EncryptedDatabase(bytes(session.fernet_key_next), db_filename)
+        new_db.encrypted_data = new_db._encrypt_db(db_content_dict)
+        new_db._save_encrypted()
+        del new_db
+        print("✓ OK: Base de datos re-encriptada y guardada.")
+
+        # 6. Reemplazar el archivo de la clave wrappeada antigua por la nueva (el paso crítico)
+        print(f"INFO: Actualizando el archivo de clave: {wrapped_key_filename}")
+        # securedelete(wrapped_key_filename) # Opcional: borrado seguro del antiguo
+        os.replace(temp_wrapped_key_filename, wrapped_key_filename)
+        secure_file_permissions(wrapped_key_filename)
+        print("✓ OK: El archivo de clave ha sido rotado.")
+        
+        return True
+
+    except Exception as e:
+        import traceback
+        print(f"❌ CRITICAL: Ocurrió un error inesperado durante la rotación de claves: {e}")
+        traceback.print_exc()
+        # En caso de error, es más seguro dejar los archivos como estaban si es posible.
+        # La lógica de recuperación dependería de en qué paso falló.
+        return False
+
+
 
 def prompt_master_password():
     """
@@ -488,82 +581,6 @@ def prompt_and_verify_two_factor():
     print("Exiting for security.")
     return None
 
-def auto_rotate_on_logout(session):
-    """
-    Automatically rotate K_db on logout for forward secrecy.
-    
-    Steps:
-    1. Generate new random K_db
-    2. Decrypt database with old K_db
-    3. Re-encrypt database with new K_db
-    4. Wrap new K_db with stored wrapping keys
-    5. Save new wrapped key
-    
-    Args:
-        session: Active session object containing keys
-        
-    Returns:
-        bool: True if rotation succeeded, False otherwise
-    """
-    try:
-        # Get files
-        db_file = get_db_filename(session.user_id)
-        wrapped_key_file = get_wrapped_key_filename(session.user_id)
-        
-        if not os.path.exists(db_file):
-            print(f"{CROSS} Database file not found. Skipping rotation.")
-            return False
-        
-        # Step 1: Generate new random K_db
-        k_db_new_raw = Fernet.generate_key()
-        k_db_new = bytearray(k_db_new_raw)
-        del k_db_new_raw
-        
-        # Step 2: Load and decrypt database with old K_db
-        k_db_old = bytes(session.fernet_key)
-        fernet_old = Fernet(k_db_old)
-        
-        with open(db_file, 'rb') as f:
-            encrypted_data_old = f.read()
-        
-        decrypted_data = fernet_old.decrypt(encrypted_data_old)
-        del fernet_old
-        del encrypted_data_old
-        
-        # Step 3: Re-encrypt with new K_db
-        fernet_new = Fernet(bytes(k_db_new))
-        encrypted_data_new = fernet_new.encrypt(decrypted_data)
-        del fernet_new
-        del decrypted_data
-        
-        # Step 4: Wrap new K_db with stored wrapping keys
-        wrapped_k_db_new = wrap_database_key(
-            bytes(k_db_new),
-            bytes(session.dnie_wrapping_key),
-            bytes(session.password_key)
-        )
-        
-        # Step 5: Save new wrapped key and encrypted database
-        with open(wrapped_key_file, 'wb') as f:
-            f.write(wrapped_k_db_new)
-        secure_file_permissions(wrapped_key_file)
-        
-        with open(db_file, 'wb') as f:
-            f.write(encrypted_data_new)
-        secure_file_permissions(db_file)
-        
-        # Cleanup
-        del k_db_new
-        del wrapped_k_db_new
-        del encrypted_data_new
-        
-        return True
-        
-    except Exception as e:
-        print(f"{CROSS} Key rotation failed: {e}")
-        return False
-
-
 def generate_salt():
     """Generate a cryptographically secure random salt."""
     return os.urandom(16)
@@ -821,16 +838,6 @@ def create_command_parser():
     delete_p.add_argument('--yes', '-y', action='store_true', 
                          help='Skip confirmation prompt (use with caution)')
     
-    # BACKUP command
-    backup_p = subparsers.add_parser('backup',
-        help='Create database backup',
-        description='Create a backup copy of the encrypted database file')
-    
-    # RESTORE command
-    restore_p = subparsers.add_parser('restore',
-        help='Restore from backup',
-        description='Restore database from the most recent backup file')
-    
     # LOCK command - immediately lock the session
     lock_p = subparsers.add_parser('lock',
         help='Lock the session immediately (requires re-authentication)',
@@ -844,7 +851,7 @@ def create_command_parser():
     # DESTROY-DB command
     destroy_p = subparsers.add_parser('destroy-db',
         help='Destroy database permanently',
-        description='{WARNING}  Permanently delete database and all backups. This action is IRREVERSIBLE!')
+        description='{WARNING}  Permanently delete database. This action is IRREVERSIBLE!')
     
     # HELP command
     help_p = subparsers.add_parser('help',
@@ -899,12 +906,6 @@ def show_enhanced_help():
       Example: list
 
  DATABASE OPERATIONS
-
-  backup
-      Create a backup of the encrypted database
-
-  restore
-      Restore database from the most recent backup
           
   lock
       Lock the session immediately (requires re-authentication)
@@ -916,7 +917,7 @@ def show_enhanced_help():
       WARNING: This destroys all existing data!
 
   destroy-db
-      Permanently delete database and all backups
+      Permanently delete database
       WARNING: This is irreversible!
 
  HELP & EXIT
@@ -1009,7 +1010,7 @@ def run_session(timeout_minutes, initial_result=None):
         print(f"Authentication: Two-Factor (DNIe + Password)")
         print(f"Session timeout: {timeout_minutes} minutes")
         print(f"Database: {db_file}")
-        print(f"Commands: add, edit, list, show, copy, delete, backup, restore, lock, init, destroy-db, exit, help")
+        print(f"Commands: add, edit, list, show, copy, delete, lock, init, destroy-db, exit, help")
         print(f"{'=' * 80}\n")
         
         try:
@@ -1342,20 +1343,6 @@ def run_session(timeout_minutes, initial_result=None):
                     else:
                         print(f"{CROSS} Failed to delete entry for '{args.service}'.")
                 
-                elif cmd == 'backup':
-                    ok = backup_database(session.user_id)
-                    print("Backup created." if ok else "Backup failed.")
-                    session.last_auth = datetime.now()
-                
-                elif cmd == 'restore':
-                    ok = restore_database(session.user_id)
-                    if ok:
-                        encrypted_db.reload_from_disk()
-                        print(f"{CHECK} Database restored from backup.")
-                    else:
-                        print(f"{CROSS} Restore failed.")
-                    session.last_auth = datetime.now()
-                
                 elif cmd == 'lock':
                     # Stop the background expiry thread
                     expiry_stop.set()
@@ -1447,7 +1434,6 @@ def run_session(timeout_minutes, initial_result=None):
                         get_db_filename(session.user_id),
                         get_salt_filename(session.user_id),
                         get_wrapped_key_filename(session.user_id),
-                        get_backup_filename(session.user_id)
                     ]
                     
                     destroy_database_files(session.user_id)

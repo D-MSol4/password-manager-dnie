@@ -107,109 +107,155 @@ class DNIeCard:
     def authenticate(self, pin):
         """
         Authenticate with PIN using signature challenge.
-        Signs a deterministic challenge to prove possession of card + PIN.
-        
-        Args:
-            pin: User's DNIe PIN
-            
-        Returns:
-            bytes: 32-byte wrapping key derived from signature
         """
         try:
             if not self.session:
                 raise DNIeCardError("Not connected to card. Call connect() first.")
             
-            # Close the read-only session and open a new one with user PIN
-            self.session.close()
-            self.session = self.token.open(user_pin=pin)
+            # CORREGIDO: Verificar si la sesión sigue siendo válida antes de cerrarla
+            try:
+                # Intentar cerrar la sesión de solo lectura si existe
+                if self.session:
+                    self.session.close()
+                    self.session = None
+            except Exception as e:
+                # Si falla al cerrar, la sesión ya estaba cerrada o inválida
+                print(f"{WARNING} Warning: Could not close existing session: {e}")
+                self.session = None
             
-            # SIGNATURE CHALLENGE APPROACH:
-            # Use deterministic challenge based on card serial number
-            # This ensures the same signature each time (needed for key derivation)
+            # CORREGIDO: Abrir nueva sesión con PIN
+            try:
+                self.session = self.token.open(user_pin=pin)
+            except Exception as e:
+                # Si falla, intentar reconectar completamente a la tarjeta
+                print(f"{WARNING} Failed to open session, attempting full reconnect...")
+                
+                # Desconectar completamente
+                try:
+                    if self.session:
+                        self.session.close()
+                except:
+                    pass
+                self.session = None
+                self.token = None
+                self.lib = None
+                
+                # Reconectar desde cero
+                self.connect()
+                
+                # Intentar abrir sesión con PIN nuevamente
+                self.session = self.token.open(user_pin=pin)
+            
+            # Create deterministic challenge
             card_serial = self.token.serial
-            
-            # Create deterministic challenge from card serial
             digest = hashes.Hash(hashes.SHA256(), backend=default_backend())
             digest.update(b'password-manager-signature-challenge-v1:')
             digest.update(card_serial.encode('utf-8') if isinstance(card_serial, str) else card_serial)
-            challenge = digest.finalize()
-            del card_serial  # Remove serial from memory
-
-            # Find private key for authentication
-            private_key = None
-            possible_labels = [
-                "KprivAutenticacion",
-                "CITIZEN AUTHENTICATION KEY",
-                "Authentication Key",
-                None  # No label filter
-            ]
+            challenge = bytearray(digest.finalize())
             
-            for label in possible_labels:
+            del card_serial
+            
+            try:
+                # Find private key for authentication
+                private_key = None
+                possible_labels = [
+                    "KprivAutenticacion",
+                    "CITIZEN AUTHENTICATION KEY",
+                    "Authentication Key",
+                    None
+                ]
+                
+                for label in possible_labels:
+                    try:
+                        if label:
+                            keys = list(self.session.get_objects({
+                                Attribute.CLASS: ObjectClass.PRIVATE_KEY,
+                                Attribute.KEY_TYPE: pkcs11.KeyType.RSA,
+                                Attribute.LABEL: label
+                            }))
+                        else:
+                            keys = list(self.session.get_objects({
+                                Attribute.CLASS: ObjectClass.PRIVATE_KEY,
+                                Attribute.KEY_TYPE: pkcs11.KeyType.RSA
+                            }))
+                        
+                        if keys:
+                            private_key = keys[0]
+                            print(f"{CHECK} Found private key" + (f": {label}" if label else ""))
+                            break
+                    except:
+                        continue
+                
+                if not private_key:
+                    raise DNIeCardError("No private key found on card for signature")
+                
+                # Sign the challenge
+                print("Signing challenge with DNIe private key...")
+                signature = bytearray(private_key.sign(
+                    bytes(challenge),
+                    mechanism=Mechanism.SHA256_RSA_PKCS
+                ))
+                
+                del private_key
+                print(f"{CHECK} Signature generated ({len(signature)} bytes)")
+                
                 try:
-                    if label:
-                        keys = list(self.session.get_objects({
-                            Attribute.CLASS: ObjectClass.PRIVATE_KEY,
-                            Attribute.KEY_TYPE: pkcs11.KeyType.RSA,
-                            Attribute.LABEL: label
-                        }))
-                    else:
-                        # Try without label filter
-                        keys = list(self.session.get_objects({
-                            Attribute.CLASS: ObjectClass.PRIVATE_KEY,
-                            Attribute.KEY_TYPE: pkcs11.KeyType.RSA
-                        }))
+                    # Derive wrapping key from signature using HKDF
+                    kdf = HKDF(
+                        algorithm=hashes.SHA256(),
+                        length=32,
+                        salt=b'dnie-signature-wrapping-key-v1',
+                        info=b'database-key-protection',
+                        backend=default_backend()
+                    )
+                    wrapping_key = kdf.derive(bytes(signature))
                     
-                    if keys:
-                        private_key = keys[0]
-                        print(f"{CHECK} Found private key" + (f": {label}" if label else ""))
-                        break
+                    return wrapping_key
+                finally:
+                    # Limpiar signature con zeroize
+                    try:
+                        from zeroize import zeroize1
+                        zeroize1(signature)
+                    except:
+                        pass
+                    del signature
+            finally:
+                # Limpiar challenge con zeroize
+                try:
+                    from zeroize import zeroize1
+                    zeroize1(challenge)
                 except:
-                    continue
-            
-            if not private_key:
-                raise DNIeCardError("No private key found on card for signature")
-            
-            # SIGN THE CHALLENGE (this proves possession of card + PIN)
-            print("Signing challenge with DNIe private key...")
-            signature = private_key.sign(
-                challenge,
-                mechanism=Mechanism.SHA256_RSA_PKCS
-            )
-            del private_key  # Remove private key reference from memory
-            print(f"{CHECK} Signature generated ({len(signature)} bytes)")
-            
-            # Derive wrapping key from signature using HKDF
-            # The signature is deterministic (same challenge → same signature)
-            # but only accessible with correct PIN
-            
-            kdf = HKDF(
-                algorithm=hashes.SHA256(),
-                length=32,
-                salt=b'dnie-signature-wrapping-key-v1',
-                info=b'database-key-protection',
-                backend=default_backend()
-            )
-            
-            wrapping_key = kdf.derive(signature)
-            del signature  # Remove signature from memory
-
-            return wrapping_key
-            
+                    pass
+                del challenge
+        
         except pkcs11.exceptions.PinIncorrect:
             raise DNIeCardError("Incorrect PIN. Please try again.")
         except pkcs11.exceptions.PinLocked:
             raise DNIeCardError("PIN locked. Too many incorrect attempts.")
         except Exception as e:
             raise DNIeCardError(f"Authentication failed: {e}")
+
     
     def disconnect(self):
         """Close session and disconnect"""
         try:
             if self.session:
-                self.session.close()
-                self.session = None
+                try:
+                    self.session.close()
+                except Exception as e:
+                    print(f"{WARNING} Warning: Error closing session: {e}")
+                finally:
+                    self.session = None
         except:
             pass
+        
+        # Limpiar referencias a token y lib
+        try:
+            self.token = None
+            self.lib = None
+        except:
+            pass
+
     
     def __enter__(self):
         """Context manager entry"""

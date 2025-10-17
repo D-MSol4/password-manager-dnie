@@ -1,7 +1,6 @@
 import os
 import sys
 import threading
-import shutil
 import string
 import secrets
 import re
@@ -58,10 +57,6 @@ def get_salt_filename(user_id):
 def get_wrapped_key_filename(user_id):
     '''Get wrapped key filename for a specific user'''
     return os.path.join(DATA_DIR, f"wrapped_key_{user_id}.bin")
-
-def get_backup_filename(user_id):
-    '''Get backup filename for a specific user'''
-    return os.path.join(DATA_DIR, f"passwords_backup_{user_id}.db")
 
 
 def is_valid_password(password: str) -> bool:
@@ -264,10 +259,6 @@ class EncryptedDatabase:
             logger.error(f"Failed to delete entry: {e}")
             return False
     
-    def reload_from_disk(self):
-        """Reload encrypted data from disk (after restore)."""
-        self._load_encrypted()
-    
     def clear(self):
         """Clear encrypted data from memory."""
         self.encrypted_data = None
@@ -295,52 +286,6 @@ def save_database(db, fernet_key, db_file):
         return False
 
 
-def backup_database(user_id):
-    """Backup database and secure permissions."""
-    try:
-        with LOCK:
-            db_file = get_db_filename(user_id)
-            backup_file = get_backup_filename(user_id)
-            if not os.path.exists(db_file):
-                return False
-            
-            shutil.copy2(db_file, backup_file)
-            
-            # Secure backup file permissions
-            secure_file_permissions(backup_file)
-            
-            return True
-    except Exception:
-        logger.error("Failed to backup database", exc_info=True)
-        return False
-
-
-def restore_database(user_id):
-    """Restore the database from backup."""
-    try:
-        with LOCK:
-            db_file = get_db_filename(user_id)
-            backup_file = get_backup_filename(user_id)
-
-            if os.path.exists(backup_file):
-                shutil.copy2(backup_file, db_file)
-                return True
-            else:
-                return False
-    except PermissionError:
-        print("Error: Unable to restore backup (permission denied)")
-        logger.error("Permission denied restoring backup", exc_info=True)
-        return False
-    except OSError:
-        print("Error: Unable to restore backup (disk error)")
-        logger.error("OS error restoring backup", exc_info=True)
-        return False
-    except Exception as e:
-        print("Error: Restore failed")
-        logger.error(f"Unexpected error in restore_database: {type(e).__name__}", exc_info=True)
-        return False
-
-
 def destroy_database_files(user_id):
     """Permanently delete ALL database-related files using secure deletion."""
     try:
@@ -349,7 +294,6 @@ def destroy_database_files(user_id):
             # Define user-specific files to delete
             files_to_delete = [
                 get_db_filename(user_id),         # passwords_userXXX.db
-                get_backup_filename(user_id),     # passwords_backup_userXXX.db
                 get_salt_filename(user_id),       # db_salt_userXXX.bin
                 get_wrapped_key_filename(user_id) # wrapped_key_userXXX.bin
             ]
@@ -500,7 +444,6 @@ def secure_all_sensitive_files():
         if user_id:
             user_files = [
                 get_db_filename(user_id),         # passwords_userXXX.db
-                get_backup_filename(user_id),     # passwords_backup_userXXX.db
                 get_salt_filename(user_id),       # db_salt_userXXX.bin
                 get_wrapped_key_filename(user_id) # wrapped_key_userXXX.bin
             ]

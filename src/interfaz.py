@@ -9,10 +9,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import QTimer, QThread, pyqtSignal, Qt
 from PyQt6.QtGui import QFont
 from datetime import datetime
-import threading
 import time
-
-from cryptography.fernet import Fernet
 
 from main import (
     Session,
@@ -25,7 +22,7 @@ from main import (
     update_last_login,
     load_dnie_registry
 )
-from smartcard_dnie import DNIeCard, DNIeCardError
+from smartcard_dnie import DNIeCard
 from crypto import derive_key_from_password, unwrap_database_key
 from database import get_wrapped_key_filename, get_salt_filename, secure_file_permissions, save_database, DNIE_REGISTRY_FILE
 
@@ -196,7 +193,7 @@ class AuthenticationDialog(QDialog):
         self.dnie_hash = dnie_hash
         self.card_found = True
         
-        # NUEVO: Verificar si el DNIe está registrado
+        # Verificar si el DNIe está registrado
         user_id = get_user_id_from_dnie(dnie_hash)
         
         if user_id is None:
@@ -355,41 +352,45 @@ class AuthenticationThread(QThread):
     def run(self):
         """Realizar autenticación completa"""
         card = None
+        dnie_wrapping_key = None
+        password_key = None
+        k_db = None
+        
         try:
             card = DNIeCard()
             card.connect()
             
             print(f"🔐 Autenticando con DNIe...")
-            dnie_wrapping_key = card.authenticate(self.pin)
+            dnie_wrapping_key = bytearray(card.authenticate(self.pin))
             print(f"✓ DNIe autenticado correctamente")
             
             user_id = get_user_id_from_dnie(self.dnie_hash)
-            
             if user_id is None:
                 print("❌ DNIe no registrado")
                 self.finished.emit(None)
                 return
             
             print(f"✓ Usuario identificado: {user_id}")
-            
             print("🔑 Derivando clave de contraseña maestra...")
+            
             salt_file = get_salt_filename(user_id)
             with open(salt_file, 'rb') as f:
                 salt = f.read()
             
-            password_key = derive_key_from_password(self.master_password, salt)
+            password_key = bytearray(derive_key_from_password(self.master_password, salt))
             print("✓ Clave de contraseña derivada")
             
             print("🔓 Desencriptando clave de base de datos...")
             wrapped_key_file = get_wrapped_key_filename(user_id)
             with open(wrapped_key_file, 'rb') as f:
                 wrapped_key = f.read()
-            
-            k_db = unwrap_database_key(wrapped_key, dnie_wrapping_key, password_key)
+
+            k_db = unwrap_database_key(wrapped_key, bytes(dnie_wrapping_key), bytes(password_key))
             print("✓ Clave de base de datos desencriptada")
             
             update_last_login(self.dnie_hash)
             
+            # Emitir resultado
             self.finished.emit((k_db, user_id, dnie_wrapping_key, password_key))
             
         except Exception as e:
@@ -397,17 +398,27 @@ class AuthenticationThread(QThread):
             import traceback
             traceback.print_exc()
             self.finished.emit(None)
+        
         finally:
-            if hasattr(self, 'pin'):
-                del self.pin
-            if hasattr(self, 'master_password'):
-                del self.master_password
             
+            # Limpiar PIN y contraseña
+            if hasattr(self, 'pin'):
+                self.pin = None  # String - no necesita zeroize
+                del self.pin
+            
+            if hasattr(self, 'master_password'):
+                self.master_password = None  # String - no necesita zeroize
+                del self.master_password 
+            
+            # Desconectar tarjeta de forma robusta
             if card:
                 try:
+                    print("DEBUG: Desconectando tarjeta DNIe...")
                     card.disconnect()
-                except:
-                    pass
+                    del card
+                    print("DEBUG: Tarjeta desconectada correctamente")
+                except Exception as e:
+                    print(f"DEBUG: Error al desconectar tarjeta: {e}")
 
 
 class PasswordManagerWindow(QMainWindow):
@@ -459,22 +470,6 @@ class PasswordManagerWindow(QMainWindow):
         
         main_layout.addWidget(self.tabs)
         
-        button_layout = QHBoxLayout()
-        
-        lock_btn = QPushButton("🔒 Bloquear Sesión")
-        lock_btn.clicked.connect(self.on_lock)
-        button_layout.addWidget(lock_btn)
-        
-        backup_btn = QPushButton("💾 Backup")
-        backup_btn.clicked.connect(self.on_backup)
-        button_layout.addWidget(backup_btn)
-        
-        restore_btn = QPushButton("📂 Restaurar")
-        restore_btn.clicked.connect(self.on_restore)
-        button_layout.addWidget(restore_btn)
-        
-        main_layout.addLayout(button_layout)
-        
         central_widget.setLayout(main_layout)
     
     def create_manage_tab(self):
@@ -493,6 +488,12 @@ class PasswordManagerWindow(QMainWindow):
         control_layout.addWidget(self.show_password_btn)
         
         control_layout.addStretch()
+
+        # Botón de bloquear sesión alineado a la derecha
+        lock_btn = QPushButton("🔒 Bloquear Sesión")
+        lock_btn.clicked.connect(self.on_lock)
+        control_layout.addWidget(lock_btn)
+
         layout.addLayout(control_layout)
         
         self.list_table = QTableWidget()
@@ -620,9 +621,26 @@ class PasswordManagerWindow(QMainWindow):
         self.add_length.setValue(20)
         layout.addWidget(self.add_length)
         
+        button_container = QHBoxLayout()
+        button_container.addStretch()  # Espacio a la izquierda
         add_btn = QPushButton("➕ Añadir Entrada")
         add_btn.clicked.connect(self.on_add_entry)
-        layout.addWidget(add_btn)
+        # Hacer el botón más alto y más estrecho
+        add_btn.setMinimumHeight(60)  # Más alto
+        add_btn.setMaximumWidth(250)   # Más estrecho
+        add_btn.setStyleSheet("""
+            QPushButton {
+                font-size: 14px;
+                font-weight: bold;
+                padding: 15px 20px;
+            }
+        """)
+        
+        button_container.addWidget(add_btn)
+        button_container.addStretch()  # Espacio a la derecha
+        
+        layout.addLayout(button_container)
+        # FIN DE LA MODIFICACIÓN
         
         layout.addStretch()
         widget.setLayout(layout)
@@ -711,7 +729,7 @@ class PasswordManagerWindow(QMainWindow):
         layout.addWidget(destroy_group)
         
         destroy_description = QLabel(
-            "Elimina permanentemente la base de datos y TODOS los backups del usuario actual.\n"
+            "Elimina permanentemente la base de datos del usuario actual.\n"
             "⚠️ ADVERTENCIA CRÍTICA: ¡Esta acción es IRREVERSIBLE! No hay manera de recuperar los datos."
         )
         destroy_description.setWordWrap(True)
@@ -1288,40 +1306,6 @@ class PasswordManagerWindow(QMainWindow):
         if self.session:
             self.session.clear_key()
             self.session.last_auth = None
-    
-    def on_backup(self):
-        """Crear backup"""
-        if not self.check_session():
-            return
-        
-        from database import backup_database
-        if backup_database(self.session.user_id):
-            QMessageBox.information(self, "Éxito", "Backup creado exitosamente")
-        else:
-            QMessageBox.critical(self, "Error", "Error al crear backup")
-    
-    def on_restore(self):
-        """Restaurar desde backup"""
-        if not self.check_session():
-            return
-        
-        reply = QMessageBox.question(
-            self,
-            "Confirmar",
-            "¿Restaurar desde backup? Esto sobrescribirá la base de datos actual.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        
-        if reply == QMessageBox.StandardButton.Yes:
-            from database import restore_database
-            if restore_database(self.session.user_id):
-                self.encrypted_db.reload_from_disk()
-                QMessageBox.information(self, "Éxito", "Base de datos restaurada")
-                
-                if self.tabs.currentIndex() == 0:
-                    self.on_list_services()
-            else:
-                QMessageBox.critical(self, "Error", "Error al restaurar")
 
     def on_change_master_password(self):
         """Cambiar la contraseña maestra"""
@@ -1467,16 +1451,16 @@ class PasswordManagerWindow(QMainWindow):
             # Re-encriptar K_db con la nueva contraseña
             new_wrapped_key = wrap_database_key(k_db, dnie_wrapping_key, new_password_key)
             
-            # Guardar nuevo salt
-            with open(salt_file, 'wb') as f:
-                f.write(new_salt)
-            secure_file_permissions(salt_file)
-            
             # Guardar nueva clave envuelta
             with open(wrapped_key_file, 'wb') as f:
                 f.write(new_wrapped_key)
             secure_file_permissions(wrapped_key_file)
             
+            # Actualizar el salt en disco
+            with open(salt_file, 'wb') as f:
+                f.write(new_salt)
+            secure_file_permissions(salt_file)
+
             # Actualizar sesión con la nueva clave de contraseña
             self.session.password_key = new_password_key
             
@@ -1829,7 +1813,6 @@ class PasswordManagerWindow(QMainWindow):
             "💣 ADVERTENCIA CRÍTICA: Destruir Base de Datos",
             "Esta acción eliminará PERMANENTEMENTE:\n"
             "• La base de datos encriptada\n"
-            "• TODOS los backups\n"
             "• Archivos de claves\n\n"
             "Esta acción es COMPLETAMENTE IRREVERSIBLE.\n"
             "NO HAY MANERA de recuperar los datos después.\n\n"
@@ -1970,8 +1953,8 @@ class PasswordManagerWindow(QMainWindow):
             
             if self.expiry_stop:
                 self.expiry_stop.set()
-                if self.expiry_thread:
-                    self.expiry_thread.join(timeout=2)
+            if self.expiry_thread:
+                self.expiry_thread.join(timeout=2)
             
             self.session.clear_key()
         

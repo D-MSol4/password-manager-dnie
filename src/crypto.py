@@ -5,6 +5,14 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.backends import default_backend
 
+try:
+    from zeroize import zeroize1
+except ImportError:
+    print("WARNING: zeroize not available")
+    def zeroize1(data):
+        """Fallback when zeroize not available"""
+        pass
+
 def derive_key_from_password(password: str, salt: bytes) -> bytes:
     """
     Derive a 32-byte key from a password using Argon2id (memory-hard).
@@ -39,7 +47,7 @@ def combine_keys(dnie_key, password_key):
         bytes: 32-byte combined key
     """
     # XOR the two keys
-    xor_key = bytes(a ^ b for a, b in zip(dnie_key, password_key))
+    xor_key = bytearray(a ^ b for a, b in zip(dnie_key, password_key))
     try:
         # Apply HKDF to ensure proper key distribution
         kdf = HKDF(
@@ -50,9 +58,10 @@ def combine_keys(dnie_key, password_key):
             backend=default_backend()
         )
     
-        combined_key = kdf.derive(xor_key)
+        combined_key = kdf.derive(bytes(xor_key))
         return combined_key
     finally:
+        zeroize1(xor_key)
         del xor_key  # Ensure XOR key is deleted from memory
 
 def wrap_database_key(k_db, dnie_wrapping_key, password_derived_key):
@@ -68,47 +77,52 @@ def wrap_database_key(k_db, dnie_wrapping_key, password_derived_key):
         bytes: Encrypted k_db
     """
     # Combine DNIe key and password key
-    master_wrapping_key = combine_keys(dnie_wrapping_key, password_derived_key)
+    master_wrapping_key = bytearray(combine_keys(dnie_wrapping_key, password_derived_key))
     
-    # Create Fernet cipher with master wrapping key
-    fernet_key = base64.urlsafe_b64encode(master_wrapping_key)
-    del master_wrapping_key  # Remove combined key from memory
-
-    f = Fernet(fernet_key)
-    del fernet_key  # Remove Fernet key from memory
-
-    # Encrypt k_db
-    wrapped = f.encrypt(k_db)
-    del f # Remove Fernet instance from memory
-
-    return wrapped
+    try:
+        # Create Fernet cipher with master wrapping key
+        fernet_key = bytearray(base64.urlsafe_b64encode(bytes(master_wrapping_key)))
+        
+        try:
+            f = Fernet(bytes(fernet_key))
+            
+            # Encrypt k_db
+            wrapped = f.encrypt(k_db)
+            
+            return wrapped
+        finally:
+            # Limpiar fernet_key con zeroize
+            zeroize1(fernet_key)
+            del fernet_key, f
+    finally:
+        # Limpiar master_wrapping_key con zeroize
+        zeroize1(master_wrapping_key)
+        del master_wrapping_key
 
 
 def unwrap_database_key(wrapped_k_db, dnie_wrapping_key, password_derived_key):
     """
     Unwrap (decrypt) the database key using DNIe + password.
-    
-    Args:
-        wrapped_k_db: Encrypted database key
-        dnie_wrapping_key: 32-byte key from DNIe signature
-        password_derived_key: 32-byte key from password (Argon2)
-    
-    Returns:
-        bytes: Decrypted 32-byte database key
     """
-    
     # Combine DNIe key and password key (same as wrapping)
-    master_wrapping_key = combine_keys(dnie_wrapping_key, password_derived_key)
+    master_wrapping_key = bytearray(combine_keys(dnie_wrapping_key, password_derived_key))
     
-    # Create Fernet cipher with master wrapping key
-    fernet_key = base64.urlsafe_b64encode(master_wrapping_key)
-    del master_wrapping_key  # Remove combined key from memory
-
-    f = Fernet(fernet_key)
-    del fernet_key  # Remove Fernet key from memory
-
-    # Decrypt k_db
-    k_db = f.decrypt(wrapped_k_db)
-    del f  # Remove Fernet instance from memory
-    
-    return k_db
+    try:
+        # Create Fernet cipher with master wrapping key
+        fernet_key = bytearray(base64.urlsafe_b64encode(bytes(master_wrapping_key)))
+        
+        try:
+            f = Fernet(bytes(fernet_key))
+            
+            # Decrypt k_db
+            k_db = f.decrypt(wrapped_k_db)
+            
+            return k_db
+        finally:
+            # Limpiar fernet_key con zeroize
+            zeroize1(fernet_key)
+            del fernet_key, f
+    finally:
+        # Limpiar master_wrapping_key con zeroize
+        zeroize1(master_wrapping_key)
+        del master_wrapping_key

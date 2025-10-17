@@ -73,9 +73,6 @@ DNIe Password Manager es un gestor de contraseñas de alta seguridad que impleme
 - 🖥️ **Doble interfaz**
   - GUI moderna con PyQt6
   - CLI para uso avanzado y scripts
-- 💾 **Backup y restauración**
-  - Copia de seguridad manual
-  - Restauración desde backup
 - 🔑 **Gestión de credenciales**
   - Cambio de contraseña maestra
   - Reinicialización de base de datos
@@ -249,12 +246,6 @@ pm> edit gmail
 Eliminar una entrada
 pm> delete gmail
 
-Hacer backup
-pm> backup
-
-Restaurar desde backup
-pm> restore
-
 Bloquear sesión
 pm> lock
 
@@ -270,20 +261,19 @@ pm> exit
 dnie-password-manager/
 │
 ├── data/                              # Directorio de datos (creado automáticamente)
-│   ├── dnie_registry.json            # Registro de DNIes
-│   ├── passwords_user001.db          # Base de datos cifrada
-│   ├── passwords_backup_user001.db   # Backup de BD
-│   ├── db_salt_user001.bin          # Salt para Argon2id
-│   └── wrapped_key_user001.bin       # K_db envuelta
+│   ├── dnie_registry.json             # Registro de DNIes
+│   ├── passwords_user001.db           # Base de datos cifrada
+│   ├── db_salt_user001.bin            # Salt para Argon2id
+│   └── wrapped_key_user001.bin        # K_db envuelta
 │
 ├── main.py                            # CLI principal
 ├── interfaz.py                        # GUI con PyQt6
-├── smartcard_dnie.py                 # Interfaz con DNIe (PKCS#11)
+├── smartcard_dnie.py                  # Interfaz con DNIe (PKCS#11)
 ├── crypto.py                          # Funciones criptográficas
 ├── database.py                        # Gestión de BD cifrada
 ├── requirements.txt                   # Dependencias Python
 ├── README.md                          # Este archivo
-└── password_manager.log              # Log de errores
+└── password_manager.log               # Log de errores
 ```
 
 
@@ -360,7 +350,6 @@ Si encuentras un bug de seguridad, **NO** abras un issue público. Contacta dire
 
 - 🔴 **Nunca compartas tu PIN del DNIe** con nadie
 - 🔴 **La contraseña maestra no es recuperable** - guárdala en lugar seguro
-- 🔴 **Haz backups regularmente** de tu base de datos
 - 🔴 **No ejecutes el código en sistemas no confiables** (riesgo de keyloggers)
 - 🟡 **Usa un antivirus actualizado** para proteger tu sistema
 
