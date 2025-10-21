@@ -106,8 +106,8 @@ El sistema implementa **rotación automática de la clave de base de datos** (`K
 
 **Proceso de rotación:**
 
-1. **Al cerrar sesión** → Se genera una nueva `K_db` aleatoria
-2. **Re-encriptación** → Toda la base de datos se desencripta con la clave antigua y se re-encripta con la nueva
+1. **Al iniciar sesión** → Se genera una nueva `K_db` aleatoria 
+2. **Re-encriptación** → Al cerrar sesión toda la base de datos se desencripta con la clave antigua y se re-encripta con la nueva
 3. **Wrapping seguro** → La nueva `K_db` se envuelve con `K_wrap` (DNIe + contraseña)
 4. **Limpieza** → La clave antigua se elimina de memoria con `zeroize()`
 
