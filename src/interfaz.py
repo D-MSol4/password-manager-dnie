@@ -1030,6 +1030,8 @@ class PasswordManagerWindow(QMainWindow):
             secure_file_permissions(salt_file)
             
             wrapped_key = wrap_database_key(k_db, dnie_wrapping_key, password_key)
+            del dnie_wrapping_key
+            del password_key
             wrapped_key_file = get_wrapped_key_filename(user_id)
             with open(wrapped_key_file, 'wb') as f:
                 f.write(wrapped_key)
@@ -1039,6 +1041,7 @@ class PasswordManagerWindow(QMainWindow):
             db_file = get_db_filename(user_id)
             empty_db = {}
             save_database(empty_db, k_db, db_file)
+            del k_db
             
             # Registrar DNIe
             registry = load_dnie_registry()
